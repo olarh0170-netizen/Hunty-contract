@@ -6,7 +6,7 @@ name: Auto-merge conflict-free PRs
 #     addressed to the PR's author, after the PR's latest push;
 #   - 10 minutes have passed since the last push or assessment comment;
 #   - GitHub reports the PR has no merge conflicts.
-# No review or status checks are required.
+#   - every status check required by the base branch has passed.
 #
 # Uses pull_request_target / issue_comment so fork PRs get a write-scoped
 # token. This job must never check out or run code from the PR: it only calls
@@ -21,6 +21,7 @@ on:
     types: [created]
 
 permissions:
+  checks: read
   contents: write
   pull-requests: write
 
@@ -38,7 +39,7 @@ jobs:
          github.event.comment.user.login == 'drips-wave[bot]')
       }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 60
     steps:
       # A new push or assessment comment cancels this run (see concurrency
       # above) and starts a fresh one, so the timer restarts on each update.
@@ -86,6 +87,24 @@ jobs:
             exit 0
           fi
           echo "Drips Wave assessment found at $assessed_at"
+
+          # Wait for all checks required by the PR's base branch. A failure
+          # stops this job before the merge command can run.
+          gh pr checks "$PR" --required --watch --interval 10
+
+          # Do not use successful check results if the PR changed while
+          # waiting. The synchronize event will start a fresh run.
+          read -r current_state current_is_draft current_head_sha < <(gh pr view "$PR" \
+            --json state,isDraft,headRefOid \
+            -q '"\(.state) \(.isDraft) \(.headRefOid)"')
+          if [ "$current_state" != "OPEN" ] || [ "$current_is_draft" = "true" ]; then
+            echo "Not merging: PR is $current_state (draft=$current_is_draft)."
+            exit 0
+          fi
+          if [ "$current_head_sha" != "$head_sha" ]; then
+            echo "Not merging: PR head changed while required checks were running."
+            exit 0
+          fi
 
           # GitHub computes mergeability asynchronously; poll until it settles.
           for _ in $(seq 1 30); do

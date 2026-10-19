@@ -101,6 +101,23 @@ If you're feeling overwhelmed, start with:
 
 Here's the process we follow. It might seem like a lot at first, but it becomes second nature pretty quickly:
 
+### Required Checks on `main`
+
+The `CI` workflow's `Test` job runs the workspace tests with
+`cargo test --locked --workspace`. Configure it as a required status check on
+the `main` branch so a failed test run cannot be merged:
+
+1. Open the repository's **Settings → Branches** and edit or create a branch
+   protection rule targeting `main` (or an equivalent ruleset).
+2. Enable **Require status checks to pass before merging**.
+3. Add the `Test` check from the `CI` workflow to the required checks. Require
+   branches to be up to date before merging so the result includes the latest
+   `main`.
+4. Save the rule.
+
+The auto-merge workflow waits for every check required by the base branch and
+will only merge after they pass.
+
 ### 1. Create a Branch
 
 Always work on a branch - never commit directly to main! This keeps things organized and makes it easy to review your work.
