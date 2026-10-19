@@ -7,7 +7,7 @@
 /// - Verify state consistency across contracts
 /// - Test error propagation between contracts
 use hunty_core::HuntyCore;
-use nft_reward::NftReward;
+use nft_reward::{CollectionMetadata, NftReward};
 use reward_manager::RewardManager;
 use soroban_sdk::testutils::{Address as _, Ledger as _};
 use soroban_sdk::{token, Address, Env, String};
@@ -213,12 +213,27 @@ fn test_migrate_pool_with_real_hunty_core() {
 fn setup_environment(env: &Env) -> (Address, Address, Address, Address, Address) {
     let core_id = env.register(HuntyCore, ());
     let reward_manager_id = env.register(RewardManager, ());
-    let nft_reward_id = env.register(NftReward, ());
     let token_admin = Address::generate(env);
     let admin = Address::generate(env);
 
     let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
     let token_address = token_contract.address();
+
+    // Deploy NftReward via constructor (admin, minter, max_supply, metadata)
+    let nft_reward_id = env.register(
+        NftReward,
+        (
+            admin.clone(),
+            admin.clone(),
+            None::<u64>,
+            CollectionMetadata {
+                name: String::from_str(env, "Hunty Rewards"),
+                description: String::from_str(env, "Reward NFTs for completed hunts"),
+                total_supply: 0,
+                creator: None,
+            },
+        ),
+    );
 
     // Initialize RewardManager
     env.as_contract(&reward_manager_id, || {
@@ -226,9 +241,8 @@ fn setup_environment(env: &Env) -> (Address, Address, Address, Address, Address)
         RewardManager::set_nft_contract(env.clone(), nft_reward_id.clone()).unwrap();
     });
 
-    // Initialize NftReward with RewardManager as authorized minter
+    // Register RewardManager as authorized minter on NftReward
     env.as_contract(&nft_reward_id, || {
-        NftReward::initialize_admin(env.clone(), admin.clone()).unwrap();
         NftReward::set_reward_manager(env.clone(), admin.clone(), reward_manager_id.clone())
             .unwrap();
     });

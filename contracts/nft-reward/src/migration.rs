@@ -1,18 +1,18 @@
-use crate::storage::Storage;
 use crate::METADATA_SCHEMA_VERSION;
 use hunty_migration::{
-    MigrationFramework, UpgradeAuthError, UpgradeAuthorization, UpgradeExecutedEvent,
-    UpgradeHistoryEntry, UpgradeProposal, UpgradeProposedEvent,
+    MigrationFramework, UpgradeAuthError, UpgradeAuthorization, UpgradeCancelledEvent,
+    UpgradeExecutedEvent, UpgradeHistoryEntry, UpgradeProposal, UpgradeProposedEvent,
 };
-use soroban_sdk::{Address, BytesN, Env, Symbol};
+use soroban_sdk::{symbol_short, Address, BytesN, Env, Symbol};
 
 pub use hunty_migration::MigrationReport;
 
+const NFT_COUNTER_KEY: Symbol = symbol_short!("CN");
+const NFT_VERSION_KEY: Symbol = symbol_short!("NFTV");
+
 /// Per-contract migration steps for NftReward storage layouts.
-#[allow(dead_code)]
 pub struct NftRewardMigration;
 
-#[allow(dead_code)]
 impl NftRewardMigration {
     pub fn get_schema_version(env: &Env) -> u32 {
         MigrationFramework::detect_version(env)
@@ -55,7 +55,25 @@ impl NftRewardMigration {
         let from_version = MigrationFramework::detect_version(env);
         let to_version = proposal.target_version;
 
-        MigrationFramework::set_version(env, to_version);
+        // Run pending data-migration steps before swapping WASM so that
+        // the stored data matches the layout expected by the new code.
+        if from_version < to_version {
+            MigrationFramework::save_rollback_point(env, from_version);
+            let mut current = from_version;
+            while current < to_version {
+                match current {
+                    0 => {
+                        Self::migrate_v0_to_v1(env);
+                        current = 1;
+                    }
+                    _ => {
+                        return Err(UpgradeAuthError::VersionMismatch);
+                    }
+                }
+            }
+            MigrationFramework::set_version(env, current);
+        }
+
         UpgradeAuthorization::finalize_upgrade_run(
             env,
             admin,
@@ -72,7 +90,8 @@ impl NftRewardMigration {
             now,
             admin.clone(),
         );
-        env.events().publish(Self::upgrade_executed_topic(env), event);
+        env.events()
+            .publish(Self::upgrade_executed_topic(env), event);
 
         env.deployer().update_current_contract_wasm(new_wasm_hash);
         Ok(())
@@ -210,7 +229,7 @@ impl NftRewardMigration {
             UpgradeAuthorization::get_upgrade_admin(env),
         )?;
         let previous =
-            MigrationFramework::rollback_version(env).ok_or(UpgradeAuthError::NoProposal)?;
+            MigrationFramework::rollback_version(env).ok_or(UpgradeAuthError::NoRollbackPoint)?;
         let current = MigrationFramework::detect_version(env);
         MigrationFramework::set_version(env, previous);
         MigrationFramework::clear_rollback(env);
@@ -251,6 +270,28 @@ impl NftRewardMigration {
         }
     }
 
+    pub fn migration_executed_event(
+        from_version: u32,
+        to_version: u32,
+        executed_at: u64,
+        executor: Address,
+    ) -> MigrationExecutedEvent {
+        MigrationExecutedEvent {
+            from_version,
+            to_version,
+            executed_at,
+            executor,
+        }
+    }
+
+    pub fn get_migration_history(
+        env: &Env,
+        offset: u32,
+        limit: u32,
+    ) -> soroban_sdk::Vec<MigrationHistoryEntry> {
+        UpgradeAuthorization::get_migration_history(env, offset, limit)
+    }
+
     pub fn upgrade_proposed_topic(env: &Env) -> (Symbol,) {
         (Symbol::new(env, "UpgradeProposed"),)
     }
@@ -259,15 +300,62 @@ impl NftRewardMigration {
         (Symbol::new(env, "UpgradeExecuted"),)
     }
 
+    pub fn upgrade_cancelled_topic(env: &Env) -> (Symbol,) {
+        (Symbol::new(env, "UpgradeCancelled"),)
+    }
+
+    pub fn upgrade_cancelled_event(
+        proposal: &UpgradeProposal,
+        cancelled_by: Address,
+        cancelled_at: u64,
+    ) -> UpgradeCancelledEvent {
+        UpgradeCancelledEvent {
+            cancelled_at,
+            proposer: proposal.proposer.clone(),
+            cancelled_by,
+            target_version: proposal.target_version,
+            wasm_hash: proposal.wasm_hash.clone(),
+        }
+    }
+
+    pub fn cancel_upgrade(
+        env: &Env,
+        admin: &Address,
+    ) -> Result<UpgradeProposal, UpgradeAuthError> {
+        UpgradeAuthorization::require_admin(
+            env,
+            admin,
+            UpgradeAuthorization::get_upgrade_admin(env),
+        )?;
+        let now = env.ledger().timestamp();
+        let proposal = UpgradeAuthorization::cancel_upgrade(
+            env,
+            admin,
+            UpgradeAuthorization::get_upgrade_admin(env),
+        )?;
+        env.events().publish(
+            Self::upgrade_cancelled_topic(env),
+            Self::upgrade_cancelled_event(&proposal, admin.clone(), now),
+        );
+        Ok(proposal)
+    }
+
     /// v0 -> v1: retroactively set metadata version key on legacy NFTs.
     fn migrate_v0_to_v1(env: &Env) {
-        let total = Storage::get_nft_counter(env);
+        let total: u64 = env
+            .storage()
+            .persistent()
+            .get(&NFT_COUNTER_KEY)
+            .unwrap_or(0);
         for nft_id in 1..=total {
+            let version_key = (NFT_VERSION_KEY, nft_id);
             // Skip NFTs that already have an explicit version key.
-            if Storage::has_nft_version_key(env, nft_id) {
+            if env.storage().persistent().has(&version_key) {
                 continue;
             }
-            Storage::set_nft_version(env, nft_id, METADATA_SCHEMA_VERSION);
+            env.storage()
+                .persistent()
+                .set(&version_key, &METADATA_SCHEMA_VERSION);
         }
     }
 

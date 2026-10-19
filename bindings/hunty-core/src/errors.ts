@@ -50,7 +50,8 @@ export const HuntErrorCode = {
   49: {message:"InvalidPoints"},
   50: {message:"HuntFull"},
   51: {message:"LeaderboardVisibilityUnauthorized"},
-  52: {message:"PrivateHuntRequiresInvite"}
+  52: {message:"InviteCodeRequired"},
+  53: {message:"TooManyAliases"}
 }
 
 
@@ -59,7 +60,9 @@ export const UpgradeAuthError = {
   2: {message:"NoProposal"},
   3: {message:"TimelockPending"},
   4: {message:"VersionMismatch"},
-  5: {message:"InvalidTimelock"}
+  5: {message:"InvalidTimelock"},
+  6: {message:"WasmHashMismatch"},
+  7: {message:"NoRollbackPoint"}
 }
 
 

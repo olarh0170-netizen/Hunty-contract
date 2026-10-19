@@ -148,7 +148,7 @@ impl RankRewardTier {
     /// Creates a rank tier with a strictly positive amount.
     pub fn new(rank: u32, xlm_amount: i128) -> Result<Self, TierError> {
         if rank == 0 {
-            return Err(TierError::NotStrictlyAscending);
+            return Err(TierError::InvalidRank);
         }
         if xlm_amount <= 0 {
             return Err(TierError::NonPositiveAmount);
@@ -189,7 +189,7 @@ pub fn rank_tiers_are_strictly_ascending(tiers: &Vec<RankRewardTier>) -> Result<
         let tier = tiers.get(i).unwrap();
         if tier.rank == 0 || tier.xlm_amount <= 0 {
             return Err(if tier.rank == 0 {
-                TierError::NotStrictlyAscending
+                TierError::InvalidRank
             } else {
                 TierError::NonPositiveAmount
             });
@@ -212,6 +212,9 @@ pub fn rank_tiers_are_strictly_ascending(tiers: &Vec<RankRewardTier>) -> Result<
 pub enum TierError {
     /// A tier's `xlm_amount` was zero or negative.
     NonPositiveAmount,
+    /// A rank tier used rank `0`. Ranks are one-based, so rank 0 is never
+    /// a valid rank (distinct from an ordering violation between tiers).
+    InvalidRank,
     /// Two adjacent tiers share the same `max_completion_secs` or appear out of
     /// ascending order. Tiers must be strictly increasing in time bound.
     NotStrictlyAscending,
@@ -271,4 +274,67 @@ pub fn tiers_are_strictly_ascending(tiers: &Vec<TimeBasedRewardTier>) -> Result<
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod rank_tier_validation_tests {
+    extern crate std;
+
+    use soroban_sdk::{vec, Env};
+
+    use super::{rank_tiers_are_strictly_ascending, RankRewardTier, TierError};
+
+    #[test]
+    fn rank_zero_reports_invalid_rank_not_ordering_error() {
+        let env = Env::default();
+        let tiers = vec![
+            &env,
+            RankRewardTier {
+                rank: 0,
+                xlm_amount: 100,
+            },
+        ];
+        assert_eq!(
+            rank_tiers_are_strictly_ascending(&tiers),
+            Err(TierError::InvalidRank)
+        );
+        assert_eq!(RankRewardTier::new(0, 100), Err(TierError::InvalidRank));
+    }
+
+    #[test]
+    fn duplicate_ranks_still_report_not_strictly_ascending() {
+        let env = Env::default();
+        let tiers = vec![
+            &env,
+            RankRewardTier {
+                rank: 1,
+                xlm_amount: 100,
+            },
+            RankRewardTier {
+                rank: 1,
+                xlm_amount: 50,
+            },
+        ];
+        assert_eq!(
+            rank_tiers_are_strictly_ascending(&tiers),
+            Err(TierError::NotStrictlyAscending)
+        );
+    }
+
+    #[test]
+    fn strictly_ascending_ranks_validate() {
+        let env = Env::default();
+        let tiers = vec![
+            &env,
+            RankRewardTier {
+                rank: 1,
+                xlm_amount: 100,
+            },
+            RankRewardTier {
+                rank: 2,
+                xlm_amount: 50,
+            },
+        ];
+        assert_eq!(rank_tiers_are_strictly_ascending(&tiers), Ok(()));
+    }
 }

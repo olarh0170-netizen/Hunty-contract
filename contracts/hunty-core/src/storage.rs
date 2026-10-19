@@ -199,6 +199,64 @@ impl Storage {
 
     const RATE_LIMIT_KEY: soroban_sdk::Symbol = symbol_short!("HRATE");
 
+    /// Per-hunt running counter: number of players who have completed the hunt.
+    /// Keyed as `(HCMPL, hunt_id)` to avoid collisions with `PLCT` (registration count).
+    const HUNT_COMPLETED_KEY: soroban_sdk::Symbol = symbol_short!("HCMPL");
+
+    /// Per-hunt running sum: cumulative `total_score` across all registered players.
+    /// Updated at registration (delta = 0) and on every clue completion.
+    /// Keyed as `(HSCRS, hunt_id)`.
+    const HUNT_SCORE_SUM_KEY: soroban_sdk::Symbol = symbol_short!("HSCRS");
+
+    // ========== Hunt Statistics Counters ==========
+
+    fn hunt_completed_key(hunt_id: u64) -> (soroban_sdk::Symbol, u64) {
+        (Self::HUNT_COMPLETED_KEY, hunt_id)
+    }
+
+    fn hunt_score_sum_key(hunt_id: u64) -> (soroban_sdk::Symbol, u64) {
+        (Self::HUNT_SCORE_SUM_KEY, hunt_id)
+    }
+
+    /// Returns the number of players who have completed this hunt.
+    /// O(1) — reads a single persistent counter.
+    pub fn get_hunt_completed_count(env: &Env, hunt_id: u64) -> u32 {
+        let key = Self::hunt_completed_key(hunt_id);
+        env.storage().persistent().get(&key).unwrap_or(0)
+    }
+
+    /// Atomically increments the per-hunt completion counter.
+    /// Called once per player when `is_completed` transitions to `true`.
+    pub fn increment_hunt_completed_count(env: &Env, hunt_id: u64) {
+        let key = Self::hunt_completed_key(hunt_id);
+        let prev: u32 = env.storage().persistent().get(&key).unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&key, &prev.saturating_add(1));
+        extend_ttl(env, &key, TtlPolicy::Active);
+    }
+
+    /// Returns the cumulative score sum for all registered players in this hunt.
+    /// O(1) — reads a single persistent counter.
+    pub fn get_hunt_score_sum(env: &Env, hunt_id: u64) -> u64 {
+        let key = Self::hunt_score_sum_key(hunt_id);
+        env.storage().persistent().get(&key).unwrap_or(0)
+    }
+
+    /// Adds `delta` to the per-hunt cumulative score sum.
+    /// Called on every successful clue completion with the points just earned.
+    pub fn add_hunt_score(env: &Env, hunt_id: u64, delta: u32) {
+        if delta == 0 {
+            return;
+        }
+        let key = Self::hunt_score_sum_key(hunt_id);
+        let prev: u64 = env.storage().persistent().get(&key).unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&key, &prev.saturating_add(delta as u64));
+        extend_ttl(env, &key, TtlPolicy::Active);
+    }
+
     /// Returns the namespaced persistent storage key for a creator's daily
     /// rate-limit counter. Using a tuple key keeps the counter from colliding
     /// with any other feature that keys persistent data by a bare `Address`.

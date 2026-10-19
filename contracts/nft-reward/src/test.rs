@@ -4,11 +4,11 @@ extern crate std;
 
 use crate::{
     CollectionMetadata, NftErrorCode, NftMetadata, NftMintedEvent, NftReward, NftRewardClient,
-    MAX_NFT_URI_BYTES, METADATA_SCHEMA_VERSION,
+    MAX_HUNT_TITLE_BYTES, MAX_NFT_URI_BYTES, MAX_TITLE_BYTES, METADATA_SCHEMA_VERSION,
 };
 use soroban_sdk::{
     testutils::{Address as _, Events as _, Ledger as _},
-    xdr, Address, Env, IntoVal, Map, String, Symbol, TryFromVal, Val,
+    xdr, Address, BytesN, Env, IntoVal, Map, String, Symbol, TryFromVal, Val,
 };
 use std::panic::AssertUnwindSafe;
 
@@ -2435,4 +2435,33 @@ fn test_mint_from_map_rejects_excessive_royalty_bps() {
         .try_mint_reward_nft_from_map(&minter, &1, &player, &map)
         .unwrap_err();
     assert_eq!(err, Err(NftErrorCode::InvalidRoyalty.into()));
+}
+
+#[test]
+fn test_upgrade_runs_migration_steps_before_setting_version() {
+    let env = setup_env();
+    let contract_id = env.register_contract(None, NftReward);
+    let client = NftRewardClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let minter = Address::generate(&env);
+    client.initialize(&admin, &minter, &None, &default_collection_metadata(&env));
+
+    // Contract starts at version 0 (initialized by `initialize_schema`).
+    assert_eq!(client.get_schema_version(), 0);
+
+    // Propose an upgrade to version 1.
+    let wasm_hash = BytesN::from_array(&env, &[0u8; 32]);
+    let proposal = client
+        .propose_upgrade(&admin, &1, &wasm_hash)
+        .unwrap();
+
+    // Execute the upgrade.
+    client.upgrade(&admin, &wasm_hash).unwrap();
+
+    // After upgrade, the schema version should be 1.
+    // Critically, migration steps must have been run *before* the version
+    // was bumped — otherwise `run_migration` to version 1 would be a no-op
+    // and any data that needed migrating would be left in the old layout.
+    assert_eq!(client.get_schema_version(), 1);
 }

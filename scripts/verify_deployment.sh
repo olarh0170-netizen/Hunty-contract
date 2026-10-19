@@ -119,6 +119,20 @@ check "HuntyCore schema"    stellar contract invoke --id "$CORE_ID" --rpc-url "$
 check "RewardManager schema" stellar contract invoke --id "$RM_ID"  --rpc-url "$RPC_URL" --network-passphrase "$PASSPHRASE" -- get_schema_version
 check "NftReward schema"    stellar contract invoke --id "$NFT_ID"  --rpc-url "$RPC_URL" --network-passphrase "$PASSPHRASE" -- get_schema_version
 
+echo ""
+echo "--- NFT Max Supply ---"
+# A max_supply of Some(0) (deployed with "0" instead of null) caps supply at
+# zero, so every mint fails with MaxSupplyReached. None (unlimited) or a
+# positive cap is fine.
+NFT_MAX_SUPPLY="$(invoke "$NFT_ID" get_max_supply || echo "")"
+if [[ "$NFT_MAX_SUPPLY" == "0" ]]; then
+  echo "  [FAIL] NftReward max_supply is Some(0): all mints will fail (redeploy with null for unlimited)"
+  ((FAIL++)) || true
+else
+  echo "  [PASS] NftReward max_supply is not zero-capped (got: '${NFT_MAX_SUPPLY:-none/unlimited}')"
+  ((PASS++)) || true
+fi
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="

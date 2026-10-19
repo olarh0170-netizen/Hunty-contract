@@ -527,7 +527,7 @@ mod test {
         );
         assert_eq!(
             crate::rank_tiers_are_strictly_ascending(&zero_rank),
-            Err(crate::TierError::NotStrictlyAscending)
+            Err(crate::TierError::InvalidRank)
         );
 
         let non_positive = Vec::from_array(
@@ -547,7 +547,7 @@ mod test {
     fn test_rank_tier_constructor_rejects_zero_rank() {
         assert_eq!(
             RankRewardTier::new(0, 100),
-            Err(crate::TierError::NotStrictlyAscending)
+            Err(crate::TierError::InvalidRank)
         );
     }
 
@@ -2773,7 +2773,7 @@ mod test {
 
             let distributor = Address::generate(&env);
             Storage::add_authorized_contract(&env, &distributor);
-            let ok = RewardManager::distribute_rewards_legacy(
+            let res = RewardManager::distribute_rewards_legacy(
                 env.clone(),
                 distributor,
                 player.clone(),
@@ -2781,11 +2781,55 @@ mod test {
                 2_000,
                 false,
             );
-            assert!(ok);
+            assert_eq!(res, Ok(()));
         });
 
         // Amounts move raw: the player receives exactly the 2_000 requested.
         assert_eq!(get_balance(&env, &token_address, &player), 2_000);
+    }
+
+    #[test]
+    fn test_distribute_rewards_legacy_underfunded_pool_rolls_back() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (contract_id, token_address, token_admin) = setup(&env);
+        let creator = Address::generate(&env);
+        let player = Address::generate(&env);
+
+        mint_tokens(&env, &token_address, &token_admin, &creator, 100_000_000);
+
+        env.as_contract(&contract_id, || {
+            initialize_contract(&env, &token_address);
+            create_pool_with_token(&env, creator.clone(), 1, token_address.clone(), 0).unwrap();
+            // Fund with only 1_000 tokens
+            RewardManager::fund_reward_pool(env.clone(), creator.clone(), 1, 1_000).unwrap();
+
+            let distributor = Address::generate(&env);
+            Storage::add_authorized_contract(&env, &distributor);
+
+            // Attempt to distribute 2_000 tokens from the underfunded pool (1_000 available)
+            let res = RewardManager::distribute_rewards_legacy(
+                env.clone(),
+                distributor,
+                player.clone(),
+                1,
+                2_000,
+                false,
+            );
+            assert_eq!(res, Err(RewardErrorCode::InsufficientPool));
+
+            // Verify distribution record was NOT written
+            let record = Storage::get_distribution_record(&env, 1, &player);
+            assert!(record.is_none());
+
+            // Verify distribution status is not distributed
+            let status = RewardManager::get_distribution_status(env.clone(), 1, player.clone());
+            assert!(!status.distributed);
+            assert_eq!(status.xlm_amount, 0);
+        });
+
+        // Verify player received 0 tokens
+        assert_eq!(get_balance(&env, &token_address, &player), 0);
     }
 
     #[test]
@@ -2907,6 +2951,58 @@ mod test {
         assert_eq!(get_balance(&env, &token_address, &contract_id), 0);
     }
 
+    /// Verifies that when a sponsor funds someone else's hunt and the hunt is cancelled,
+    /// the sponsor receives their share back upon refund_pool rather than the creator
+    /// receiving the sponsor's tokens.
+    #[test]
+    fn test_sponsor_funds_hunt_cancelled_sponsor_gets_share_back() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (contract_id, token_address, token_admin) = setup(&env);
+        let creator = Address::generate(&env);
+        let sponsor = Address::generate(&env);
+        let hunty_core = env.register(MockHuntyCore, ());
+        let hunt_id = 999;
+
+        mint_tokens(&env, &token_address, &token_admin, &creator, 100_000_000);
+        mint_tokens(&env, &token_address, &token_admin, &sponsor, 100_000_000);
+
+        env.as_contract(&contract_id, || {
+            init_and_create_pool(
+                &env,
+                token_admin.clone(),
+                &token_address,
+                &hunty_core,
+                creator.clone(),
+                hunt_id,
+            );
+
+            // Sponsor funds someone else's hunt
+            RewardManager::fund_reward_pool(env.clone(), sponsor.clone(), hunt_id, 50_000_000).unwrap();
+
+            // Verify sponsor is recorded as funder
+            assert_eq!(
+                RewardManager::get_pool_funder_contribution(env.clone(), hunt_id, sponsor.clone()),
+                50_000_000
+            );
+            assert_eq!(
+                RewardManager::get_pool_funders(env.clone(), hunt_id),
+                Vec::from_array(&env, [sponsor.clone()])
+            );
+
+            // Hunt cancelled/ended: creator calls refund_pool
+            RewardManager::refund_pool(env.clone(), creator.clone(), hunt_id).unwrap();
+
+            assert_eq!(RewardManager::get_pool_balance(env.clone(), hunt_id), 0);
+        });
+
+        // Sponsor gets their 50M back in full (100M total balance restored)
+        assert_eq!(get_balance(&env, &token_address, &sponsor), 100_000_000);
+        // Creator did not fund anything, so creator balance remains 100M (did not steal sponsor's funds)
+        assert_eq!(get_balance(&env, &token_address, &creator), 100_000_000);
+        assert_eq!(get_balance(&env, &token_address, &contract_id), 0);
+    }
+
     /// Verifies pro-rata splitting still holds after the balance has been
     /// partially drawn down by a distribution — the split is proportional to
     /// each funder's *contribution*, applied to whatever balance remains, not
@@ -2962,6 +3058,60 @@ mod test {
             get_balance(&env, &token_address, &sponsor),
             100_000_000 - 60_000_000 + 42_000_000
         );
+    }
+
+    #[test]
+    fn test_proportional_distributions_use_original_pool_balance() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (contract_id, token_address, token_admin) = setup(&env);
+        let creator = Address::generate(&env);
+        let first_player = Address::generate(&env);
+        let second_player = Address::generate(&env);
+
+        mint_tokens(&env, &token_address, &token_admin, &contract_id, 100);
+
+        env.as_contract(&contract_id, || {
+            let mut config = seed_pool_config(&env, 42, creator, token_address.clone());
+            config.distribution_mode = DistributionMode::Proportional;
+            Storage::set_pool_config(&env, 42, &config);
+            Storage::set_pool_balance(&env, 42, 100);
+
+            let first_caller = Address::generate(&env);
+            Storage::add_authorized_contract(&env, &first_caller);
+            assert_eq!(
+                RewardManager::distribute_proportional(
+                    env.clone(),
+                    first_caller,
+                    42,
+                    first_player.clone(),
+                    50,
+                    100,
+                )
+                .unwrap(),
+                50
+            );
+
+            let second_caller = Address::generate(&env);
+            Storage::add_authorized_contract(&env, &second_caller);
+            assert_eq!(
+                RewardManager::distribute_proportional(
+                    env.clone(),
+                    second_caller,
+                    42,
+                    second_player.clone(),
+                    50,
+                    100,
+                )
+                .unwrap(),
+                50
+            );
+
+            assert_eq!(RewardManager::get_pool_balance(env.clone(), 42), 0);
+        });
+
+        assert_eq!(get_balance(&env, &token_address, &first_player), 50);
+        assert_eq!(get_balance(&env, &token_address, &second_player), 50);
     }
 
     #[test]
@@ -3393,7 +3543,7 @@ mod test {
 
             let result = env.try_invoke_contract::<(), RewardErrorCode>(
                 &contract_id,
-                &Symbol::new(&env, "distribute_rewards_authorized"),
+                &Symbol::new(&env, "distribute_rewards"),
                 args,
             );
             assert_eq!(result, Err(Ok(RewardErrorCode::Unauthorized)));
@@ -5276,6 +5426,70 @@ mod test {
         });
     }
 
+    #[test]
+    fn test_emergency_withdraw_preserves_accounting_identity_and_clears_funders() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (contract_id, token_address, token_admin) = setup(&env);
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let sponsor = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let hunty_core = env.register(MockHuntyCore, ());
+
+        mint_tokens(&env, &token_address, &token_admin, &creator, 100_000_000);
+        mint_tokens(&env, &token_address, &token_admin, &sponsor, 100_000_000);
+
+        env.as_contract(&contract_id, || {
+            init_and_create_pool(
+                &env,
+                admin.clone(),
+                &token_address,
+                &hunty_core,
+                creator.clone(),
+                1,
+            );
+            RewardManager::fund_reward_pool(env.clone(), creator.clone(), 1, 60_000_000).unwrap();
+            RewardManager::fund_reward_pool(env.clone(), sponsor.clone(), 1, 40_000_000).unwrap();
+            let reason = soroban_sdk::String::from_str(&env, "Emergency withdrawal");
+            RewardManager::pause(env.clone(), admin.clone(), reason.clone()).unwrap();
+
+            assert_eq!(
+                RewardManager::emergency_withdraw(
+                    env.clone(),
+                    admin.clone(),
+                    1,
+                    recipient.clone(),
+                    reason,
+                    1,
+                ),
+                Ok(100_000_000)
+            );
+
+            let pool = RewardManager::get_reward_pool(env.clone(), 1).unwrap();
+            assert_eq!(pool.balance, 0);
+            assert_eq!(pool.total_refunded, 100_000_000);
+            assert_eq!(
+                pool.total_deposited,
+                pool.balance
+                    + pool.total_distributed
+                    + pool.total_refunded
+                    + pool.total_migrated_out
+            );
+            assert_eq!(RewardManager::get_pool_funders(env.clone(), 1), Vec::new(&env));
+            assert_eq!(
+                RewardManager::get_pool_funder_contribution(env.clone(), 1, creator.clone()),
+                0
+            );
+            assert_eq!(
+                RewardManager::get_pool_funder_contribution(env.clone(), 1, sponsor.clone()),
+                0
+            );
+        });
+
+        assert_eq!(get_balance(&env, &token_address, &recipient), 100_000_000);
+    }
+
     /// Verifies that add_authorized_contract requires authorization from the admin.
     #[test]
     fn test_add_authorized_contract_requires_authorization() {
@@ -5567,6 +5781,40 @@ mod test {
                 .collect();
 
             assert!(!refund_events.is_empty(), "RefundedEvent should be emitted");
+        });
+    }
+
+    /// #1286: `get_reward_pool` exposes `total_refunded`, so the accounting
+    /// identity can be checked from one call.
+    #[test]
+    fn test_get_reward_pool_reports_total_refunded() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (contract_id, token_address, token_admin) = setup(&env);
+        let creator = Address::generate(&env);
+        mint_tokens(&env, &token_address, &token_admin, &creator, 100_000_000);
+
+        env.as_contract(&contract_id, || {
+            initialize_contract(&env, &token_address);
+            create_pool_with_token(&env, creator.clone(), 1286, token_address.clone(), 1_000)
+                .unwrap();
+            RewardManager::fund_reward_pool(env.clone(), creator.clone(), 1286, 60_000_000)
+                .unwrap();
+
+            let before = RewardManager::get_reward_pool(env.clone(), 1286).unwrap();
+            assert_eq!(before.total_refunded, 0);
+
+            RewardManager::refund_pool(env.clone(), creator.clone(), 1286).unwrap();
+
+            let after = RewardManager::get_reward_pool(env.clone(), 1286).unwrap();
+            assert_eq!(after.total_refunded, 60_000_000);
+            assert_eq!(
+                after.total_deposited,
+                after.balance
+                    + after.total_distributed
+                    + after.total_refunded
+                    + after.total_migrated_out
+            );
         });
     }
 
@@ -5939,6 +6187,206 @@ mod test {
                     "expected one {topic:?} event"
                 );
             }
+        });
+    }
+
+    /// Verifies that pool setters reject modifications when HuntyCore reports the hunt as non-Draft
+    /// (e.g. Active, Completed) to prevent creators from altering tiers, mode, vesting, min distribution,
+    /// or NFT contract after players have competed / completed.
+    #[test]
+    fn test_pool_setters_reject_non_draft_hunt() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (contract_id, token_address, _token_admin) = setup(&env);
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let hunt_id = 42;
+
+        // Hunt is Active (status = 1)
+        let hunty_core_id = setup_status_hunty_core(&env, hunt_id, 1);
+
+        env.as_contract(&contract_id, || {
+            RewardManager::initialize(
+                env.clone(),
+                admin.clone(),
+                token_address.clone(),
+                hunty_core_id.clone(),
+            )
+            .unwrap();
+            seed_funded_pool(
+                &env,
+                hunt_id,
+                creator.clone(),
+                token_address.clone(),
+                10_000_000,
+            );
+        });
+
+        env.mock_all_auths_allowing_non_root_auth();
+        env.as_contract(&contract_id, || {
+            // 1. update_pool_config
+            let res = RewardManager::update_pool_config(env.clone(), creator.clone(), hunt_id, 100);
+            assert_eq!(res, Err(RewardErrorCode::InvalidHuntStatus));
+
+            // 2. set_min_distribution_interval
+            let res = RewardManager::set_min_distribution_interval(
+                env.clone(),
+                creator.clone(),
+                hunt_id,
+                300,
+            );
+            assert_eq!(res, Err(RewardErrorCode::InvalidHuntStatus));
+
+            // 3. set_distribution_mode
+            let res = RewardManager::set_distribution_mode(
+                env.clone(),
+                creator.clone(),
+                hunt_id,
+                DistributionMode::Proportional,
+            );
+            assert_eq!(res, Err(RewardErrorCode::InvalidHuntStatus));
+
+            // 4. set_pool_tiers
+            let mut tiers = Vec::new(&env);
+            tiers.push_back(_TimeBasedRewardTier {
+                max_completion_secs: 60,
+                xlm_amount: 1_000,
+            });
+            let res = RewardManager::set_pool_tiers(env.clone(), creator.clone(), hunt_id, tiers);
+            assert_eq!(res, Err(RewardErrorCode::InvalidHuntStatus));
+
+            // 5. set_pool_rank_tiers
+            let mut rank_tiers = Vec::new(&env);
+            rank_tiers.push_back(RankRewardTier {
+                rank: 1,
+                xlm_amount: 5_000,
+            });
+            let res = RewardManager::set_pool_rank_tiers(
+                env.clone(),
+                creator.clone(),
+                hunt_id,
+                rank_tiers,
+            );
+            assert_eq!(res, Err(RewardErrorCode::InvalidHuntStatus));
+
+            // 6. set_pool_nft_contract
+            let dummy_nft = Address::generate(&env);
+            let res = RewardManager::set_pool_nft_contract(
+                env.clone(),
+                creator.clone(),
+                hunt_id,
+                Some(dummy_nft),
+            );
+            assert_eq!(res, Err(RewardErrorCode::InvalidHuntStatus));
+
+            // 7. set_vesting_period_secs
+            let res =
+                RewardManager::set_vesting_period_secs(env.clone(), creator.clone(), hunt_id, 7200);
+            assert_eq!(res, Err(RewardErrorCode::InvalidHuntStatus));
+        });
+    }
+
+    /// Verifies that pool setters allow modifications when HuntyCore reports the hunt as Draft (status = 0).
+    #[test]
+    fn test_pool_setters_allow_draft_hunt() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (contract_id, token_address, _token_admin) = setup(&env);
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let hunt_id = 99;
+
+        // Hunt is Draft (status = 0)
+        let hunty_core_id = setup_status_hunty_core(&env, hunt_id, 0);
+
+        env.as_contract(&contract_id, || {
+            RewardManager::initialize(
+                env.clone(),
+                admin.clone(),
+                token_address.clone(),
+                hunty_core_id.clone(),
+            )
+            .unwrap();
+            seed_funded_pool(
+                &env,
+                hunt_id,
+                creator.clone(),
+                token_address.clone(),
+                10_000_000,
+            );
+        });
+
+        env.mock_all_auths_allowing_non_root_auth();
+        env.as_contract(&contract_id, || {
+            // 1. update_pool_config
+            let res = RewardManager::update_pool_config(env.clone(), creator.clone(), hunt_id, 100);
+            assert!(res.is_ok());
+
+            // 2. set_min_distribution_interval
+            let res = RewardManager::set_min_distribution_interval(
+                env.clone(),
+                creator.clone(),
+                hunt_id,
+                300,
+            );
+            assert!(res.is_ok());
+
+            // 3. set_distribution_mode
+            let res = RewardManager::set_distribution_mode(
+                env.clone(),
+                creator.clone(),
+                hunt_id,
+                DistributionMode::Proportional,
+            );
+            assert!(res.is_ok());
+
+            // 4. set_pool_tiers
+            let mut tiers = Vec::new(&env);
+            tiers.push_back(_TimeBasedRewardTier {
+                max_completion_secs: 60,
+                xlm_amount: 1_000,
+            });
+            let res = RewardManager::set_pool_tiers(env.clone(), creator.clone(), hunt_id, tiers);
+            assert!(res.is_ok());
+
+            // 5. set_pool_rank_tiers
+            let mut rank_tiers = Vec::new(&env);
+            rank_tiers.push_back(RankRewardTier {
+                rank: 1,
+                xlm_amount: 5_000,
+            });
+            let res = RewardManager::set_pool_rank_tiers(
+                env.clone(),
+                creator.clone(),
+                hunt_id,
+                rank_tiers,
+            );
+            assert!(res.is_ok());
+
+            // 6. set_pool_nft_contract
+            let dummy_nft = Address::generate(&env);
+            let res = RewardManager::set_pool_nft_contract(
+                env.clone(),
+                creator.clone(),
+                hunt_id,
+                Some(dummy_nft.clone()),
+            );
+            assert!(res.is_ok());
+
+            // 7. set_vesting_period_secs
+            let res =
+                RewardManager::set_vesting_period_secs(env.clone(), creator.clone(), hunt_id, 7200);
+            assert!(res.is_ok());
+
+            // Verify the updated values in pool config
+            let config = RewardManager::get_pool_config(env.clone(), hunt_id).unwrap();
+            assert_eq!(config.min_distribution_amount, 100);
+            assert_eq!(config.min_distribution_interval_secs, 300);
+            assert_eq!(config.distribution_mode, DistributionMode::Proportional);
+            assert_eq!(config.time_based_tiers.len(), 1);
+            assert_eq!(config.rank_based_tiers.len(), 1);
+            assert_eq!(config.nft_contract, Some(dummy_nft));
+            assert_eq!(config.vesting_period_secs, 7200);
         });
     }
 }

@@ -104,7 +104,8 @@ contract_id=$(stellar contract deploy \
   --wasm-hash "$wasm_hash" \
   --rpc-url "$RPC_URL" \
   --network-passphrase "$NETWORK_PASSPHRASE" \
-  --source deployer)
+  --source deployer \
+  -- "$ADMIN_ADDRESS")
 log "  Contract ID  : $contract_id"
 NEW_IDS["hunty-core"]="$contract_id"
 
@@ -137,13 +138,16 @@ wasm_hash=$(stellar contract upload \
   --source deployer)
 log "  WASM uploaded: $wasm_hash"
 
+# max_supply is Option<u64>: pass null (None) for unlimited.
+# Do NOT pass "0" — the CLI encodes it as Some(0), capping supply at zero so
+# every mint fails with MaxSupplyReached.
 NFT_METADATA="{\"name\":\"Hunty NFT Reward\",\"description\":\"Reward NFTs for completed hunts\",\"total_supply\":0,\"creator\":\"$ADMIN_ADDRESS\"}"
 contract_id=$(stellar contract deploy \
   --wasm-hash "$wasm_hash" \
   --rpc-url "$RPC_URL" \
   --network-passphrase "$NETWORK_PASSPHRASE" \
   --source deployer \
-  -- "$ADMIN_ADDRESS" "$ADMIN_ADDRESS" "0" "$NFT_METADATA")
+  -- "$ADMIN_ADDRESS" "$ADMIN_ADDRESS" null "$NFT_METADATA")
 log "  Contract ID  : $contract_id"
 NEW_IDS["nft-reward"]="$contract_id"
 
@@ -172,15 +176,10 @@ stellar contract invoke \
   --contract "${NEW_IDS[reward-manager]}"
 log "  reward-manager registered as minter on nft-reward."
 
-# 3. Initialize hunty-core (still needs initialize_admin)
-stellar contract invoke \
-  --id "${NEW_IDS[hunty-core]}" \
-  --rpc-url "$RPC_URL" \
-  --network-passphrase "$NETWORK_PASSPHRASE" \
-  --source deployer \
-  -- initialize_admin \
-  --admin "$ADMIN_ADDRESS"
-log "  hunty-core initialized."
+# 3. hunty-core admin is set atomically by __constructor at deploy time;
+# no separate initialize_admin call (it would revert, and leaving this step
+# out closes the front-running window between deploy and init).
+log "  hunty-core admin set via constructor."
 
 # 4. Link reward-manager to hunty-core
 stellar contract invoke \

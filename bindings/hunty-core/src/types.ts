@@ -14,6 +14,17 @@ export interface HealthAlert {
 }
 
 
+export interface GcReport {
+  clues_swept: u32;
+  hunt_id: u64;
+  instance_removed: u32;
+  persistent_removed: u32;
+  players_swept: u32;
+  teams_swept: u32;
+  total_removed: u32;
+}
+
+
 export interface ContractHealth {
   active_alerts: u32;
   avg_gas_units: u64;
@@ -181,6 +192,12 @@ export interface BatchClueInput {
   is_required: boolean;
   points: u32;
   question: string;
+  /**
+ * Optional weight multiplier, matching the `weight` argument of
+ * `add_clue`. `None` defaults to 1; `Some(0)` is rejected with
+ * `InvalidWeight`.
+ */
+  weight: Option<u32>;
 }
 
 

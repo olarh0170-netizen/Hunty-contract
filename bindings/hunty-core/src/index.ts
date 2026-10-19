@@ -13,3 +13,4 @@ export * from "./events.js";
 export * from "./errors.js";
 export * from "./reward-types.js";
 export * from "./client.js";
+export * from "./answer-hash.js";

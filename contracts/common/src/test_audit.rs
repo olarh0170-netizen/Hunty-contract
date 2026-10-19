@@ -1,4 +1,7 @@
 #[cfg(test)]
+extern crate std;
+
+#[cfg(test)]
 mod tests {
     use crate::audit::*;
     use crate::audit_emitter::emit_audit_event;
@@ -10,7 +13,7 @@ mod tests {
 
     /// Decodes the event topic at `index` as a [`Symbol`].
     fn symbol_at(env: &Env, topics: &Vec<Val>, index: u32) -> Symbol {
-        Symbol::try_from_val(env, &topics.get(index)).unwrap()
+        Symbol::try_from_val(env, &topics.get(index).unwrap()).unwrap()
     }
 
     /// Returns the recorded contract events as `(contract, topics, data)` tuples.
@@ -37,7 +40,7 @@ mod tests {
                     .collect::<Result<std::vec::Vec<Val>, _>>()
                     .ok()?;
                 let data = Val::try_from_val(env, &body.data).ok()?;
-                Some((contract, topics, data))
+                Some((contract, Vec::from_iter(topics), data))
             })
             .collect()
     }
@@ -64,7 +67,7 @@ mod tests {
         assert_eq!(topics.len(), 3);
         assert_eq!(symbol_at(&env, &topics, 0), TOPIC_AUDIT);
         assert_eq!(symbol_at(&env, &topics, 1), ACTION_PAUSE);
-        assert_eq!(Address::try_from_val(&env, &topics.get(2)).unwrap(), admin);
+        assert_eq!(Address::try_from_val(&env, &topics.get(2).unwrap()).unwrap(), admin);
 
         let event = AuditEvent::try_from_val(&env, &data).unwrap();
         assert_eq!(event.admin_address, admin);
