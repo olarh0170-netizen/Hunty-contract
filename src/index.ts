@@ -33,6 +33,15 @@ export function createApp({ config, limiter }: AppDeps): express.Express {
 
   app.use('/mint', globalLimiter);
 
+  const adminLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 5,
+    standardHeaders: true,
+    legacyHeaders: false,
+  });
+
+  app.use('/admin', adminLimiter);
+
   app.get('/health', (_req, res) => {
     res.json({ status: 'ok', ...publicConfig(config) });
   });
@@ -54,7 +63,7 @@ export function createApp({ config, limiter }: AppDeps): express.Express {
 </html>`);
   });
 
-  app.post('/mint', async (req, res) => {
+  app.post('/mint/reserve', async (req, res) => {
     const { address } = req.body;
     if (!address || typeof address !== 'string' || !/^G[A-Z2-7]{55}$/.test(address)) {
       res.status(400).json({ error: 'invalid address' });
@@ -62,7 +71,7 @@ export function createApp({ config, limiter }: AppDeps): express.Express {
     }
     try {
       await limiter.mint(address);
-      res.json({ minted: true, mintsInWindow: await limiter.getMintCount(address) });
+      res.json({ reserved: true, reservationsInWindow: await limiter.getMintCount(address) });
     } catch (err) {
       if (err instanceof MintRateLimitError) {
         res.status(429).json({
@@ -76,28 +85,31 @@ export function createApp({ config, limiter }: AppDeps): express.Express {
   });
 
   app.get('/mint/count/:address', async (req, res) => {
+    if (!/^G[A-Z2-7]{55}$/.test(req.params.address)) {
+      res.status(400).json({ error: 'invalid address' });
+      return;
+    }
     const count = await limiter.getMintCount(req.params.address);
-    res.json({ address: req.params.address, mintsInWindow: count });
+    res.json({ address: req.params.address, reservationsInWindow: count });
   });
 
-  app.get('/admin/config', (req, res) => {
+  app.get('/admin/config', async (req, res) => {
     const secret = req.headers['x-admin-secret'] as string;
     if (!secret || secret !== config.adminSecret) {
       res.status(403).json({ error: 'Unauthorized' });
       return;
     }
-    res.json({ rateLimit: limiter.getConfig(), ...publicConfig(config) });
+    res.json({ rateLimit: await limiter.getConfig(), ...publicConfig(config) });
   });
 
-  app.patch('/admin/config', (req, res) => {
+  app.patch('/admin/config', async (req, res) => {
     const secret = req.headers['x-admin-secret'] as string;
     if (!secret || secret !== config.adminSecret) {
       res.status(403).json({ error: 'Unauthorized' });
       return;
     }
     try {
-      limiter.updateConfig(req.body, secret);
-      res.json(limiter.getConfig());
+      res.json(await limiter.updateConfig(req.body, secret));
     } catch (err) {
       res.status(400).json({ error: (err as Error).message });
     }

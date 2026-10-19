@@ -43,8 +43,6 @@ fn metadata(env: &Env, title: &str) -> NftMetadata {
 }
 
 fn setup<'a>(env: &'a Env) -> (NftRewardClient<'a>, Address) {
-    let contract_id = env.register_contract(None, NftReward);
-    let client = NftRewardClient::new(env, &contract_id);
     let admin = Address::generate(env);
     let minter = Address::generate(env);
     let collection = CollectionMetadata {
@@ -53,7 +51,8 @@ fn setup<'a>(env: &'a Env) -> (NftRewardClient<'a>, Address) {
         total_supply: 0,
         creator: None,
     };
-    client.initialize(&admin, &minter, &None, &collection);
+    let contract_id = env.register(NftReward, (admin, minter.clone(), None::<u64>, collection));
+    let client = NftRewardClient::new(env, &contract_id);
     (client, minter)
 }
 

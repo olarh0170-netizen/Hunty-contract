@@ -97,23 +97,37 @@ mod tests {
 
 #[cfg(test)]
 mod difficulty_override_test;
+// Regression tests for #1251 (difficulty_rating must round, not truncate).
+#[cfg(test)]
+mod difficulty_rating_rounding_test;
 #[cfg(test)]
 mod incorrect_answer_outcome_test;
 #[cfg(test)]
 mod invite_registration_deadline_test;
 #[cfg(test)]
 mod list_hunts_test;
+// Regression tests for #1253 (hunt categories must not keep duplicates).
+#[cfg(test)]
+mod hunt_categories_dedup_test;
 #[cfg(test)]
 #[path = "paused_status_test.rs"]
 mod paused_status_test;
 #[cfg(test)]
 mod registration_capacity_test;
+// Regression tests for #1252 (batch clue weight).
+#[cfg(test)]
+mod batch_clue_weight_test;
 #[cfg(test)]
 mod submission_recording_test;
+// Regression tests for #1255 (answer normalization).
+#[cfg(test)]
+mod answer_normalization_test;
 // Regression tests for #1011-#1014 (admin persistence, reward-config auth,
 // global pause checks, duplicate registration).
 #[cfg(test)]
 mod security_1011_1014_test;
+#[cfg(test)]
+mod statistics_counters_test;
 const MAX_QUESTION_LENGTH: u32 = 2000;
 const MAX_ANSWER_LENGTH: u32 = 256;
 /// Maximum invite-code length in bytes.
@@ -174,6 +188,13 @@ pub struct HuntyCore;
 #[allow(clippy::too_many_arguments)]
 #[contractimpl]
 impl HuntyCore {
+    /// Constructor - runs atomically during deployment.
+    /// Sets the admin in the same transaction as deployment so no one can
+    /// front-run `initialize_admin` and claim admin rights.
+    pub fn __constructor(env: Env, admin: Address) {
+        Storage::set_admin(&env, &admin);
+    }
+
     /// Sets the contract admin once. Subsequent calls require current admin auth via set_admin.
     pub fn initialize_admin(env: Env, admin: Address) -> Result<(), HuntErrorCode> {
         admin.require_auth();
@@ -815,7 +836,8 @@ impl HuntyCore {
     /// * `env` - The Soroban environment
     /// * `hunt_id` - The hunt to add the clue to
     /// * `question` - The clue question text (max 2000 chars, non-empty)
-    /// * `answer` - Plain-text answer; normalized (trimmed, lowercased) then hashed
+    /// * `answer` - Plain-text answer; normalized (trimmed, whitespace-collapsed,
+    ///   ASCII-lowercased) then hashed
     /// * `points` - Points awarded for solving this clue (must be within 1..=10_000)
     /// * `is_required` - Whether this clue must be solved to complete the hunt
     /// * `difficulty` - Optional difficulty tier (defaults to 1) used as a multiplier on
@@ -881,6 +903,9 @@ impl HuntyCore {
     ///
     /// The batch is validated against the per-hunt clue cap before writing any new clues,
     /// so a request that would exceed the limit fails without partially adding clues.
+    ///
+    /// Each [`BatchClueInput`] carries the same optional `weight` as [`Self::add_clue`],
+    /// so batch-added clues can be configured exactly like single-clue additions.
     pub fn add_clues(
         env: Env,
         hunt_id: u64,
@@ -912,7 +937,7 @@ impl HuntyCore {
                 clue.points,
                 clue.is_required,
                 Some(clue.difficulty),
-                None, // weight defaults to 1 in insert_clue
+                clue.weight,
             )?;
             clue_ids.push_back(clue_id);
             if clue.is_required {
@@ -1178,7 +1203,11 @@ impl HuntyCore {
         hunts
     }
 
-    /// Updates categories for a draft hunt. At most five categories are allowed.
+    /// Updates categories for a draft hunt. At most five distinct categories are allowed.
+    ///
+    /// Categories are sanitized (trimmed, validated) and duplicates are collapsed,
+    /// preserving first-seen order, so repeated entries do not use up the five
+    /// slots. Comparison is case-sensitive: `"art"` and `"Art"` are distinct.
     pub fn set_hunt_categories(
         env: Env,
         hunt_id: u64,
@@ -1404,44 +1433,76 @@ impl HuntyCore {
         out
     }
 
-    /// Normalizes answer (trim, lowercase) and returns SHA256 hash as BytesN<32>.
-    /// Uses hunt_id and clue_id as salt to prevent rainbow table precomputation.
-    /// Hashing scheme: SHA256(hunt_id || clue_id || normalized_answer)
+    /// Normalizes an answer and returns SHA256(hunt_id || clue_id || normalized_answer).
+    ///
+    /// The hunt and clue ids act as a salt so the hashes cannot be precomputed
+    /// from a rainbow table of common answers.
+    ///
+    /// Normalization is applied to the raw UTF-8 bytes:
+    ///
+    /// - leading and trailing ASCII whitespace (space, `\t`, `\n`, `\r`) is trimmed;
+    /// - an internal run of those characters collapses to a single space, so
+    ///   `"New   York"` and `"new york"` produce the same hash;
+    /// - ASCII `A-Z` is lowercased.
+    ///
+    /// # Non-ASCII input
+    ///
+    /// Non-ASCII characters are preserved byte-for-byte: `ÉCOLE` lowercases to
+    /// `École`, not `école`. The contract cannot perform Unicode case folding or
+    /// normalization on-chain, so creators who expect accented or non-Latin
+    /// spellings should register the variants with [`Self::add_clue_aliases`].
+    ///
+    /// Off-chain callers of [`Self::submit_answer_with_hash`] must apply exactly
+    /// this normalization before hashing (see `bindings/hunty-core`
+    /// `hashAnswer`).
     pub(crate) fn normalize_and_hash_answer(
         env: &Env,
         hunt_id: u64,
         clue_id: u32,
         answer: &String,
     ) -> Result<BytesN<32>, HuntError> {
+        // Sanitizing validates UTF-8 and trims the outer whitespace.
         let answer =
             crate::sanitization::StringSanitizer::sanitize(env, answer, MAX_ANSWER_LENGTH, false)
                 .map_err(|_| HuntError::InvalidAnswer)?;
-        let n = answer.len();
+        let n = answer.len() as usize;
         if n == 0 {
             return Err(HuntError::InvalidAnswer);
         }
-        let mut buf = [0u8; 256 + 12];
+
+        let mut raw = [0u8; MAX_ANSWER_LENGTH as usize];
+        answer.copy_into_slice(&mut raw[..n]);
+
+        let mut buf = [0u8; 12 + MAX_ANSWER_LENGTH as usize];
         buf[..8].copy_from_slice(&hunt_id.to_be_bytes());
         buf[8..12].copy_from_slice(&clue_id.to_be_bytes());
-        answer.copy_into_slice(&mut buf[12..12 + n as usize]);
-        let total_len = 12 + n as usize;
-        let mut start = 12usize;
-        let mut end = total_len;
-        while start < end && Self::is_ascii_space(buf[start]) {
-            start += 1;
-        }
-        while end > start && Self::is_ascii_space(buf[end - 1]) {
-            end -= 1;
-        }
-        if start >= end {
-            return Err(HuntError::InvalidAnswer);
-        }
-        for b in &mut buf[start..end] {
-            if b.is_ascii_uppercase() {
-                *b += b'a' - b'A';
+
+        // Collapse internal whitespace runs while lowercasing ASCII. The input
+        // was already trimmed by the sanitizer, so this cannot start or end
+        // with a space. Collapsing only shortens the input, so `buf` is large
+        // enough. ASCII whitespace bytes never occur inside a multi-byte UTF-8
+        // sequence, so byte-wise processing keeps non-ASCII text intact.
+        let mut out = 12usize;
+        let mut pending_space = false;
+        for &b in &raw[..n] {
+            if Self::is_ascii_space(b) {
+                pending_space = true;
+                continue;
             }
+            if pending_space && out > 12 {
+                buf[out] = b' ';
+                out += 1;
+            }
+            pending_space = false;
+            buf[out] = if b.is_ascii_uppercase() {
+                b + (b'a' - b'A')
+            } else {
+                b
+            };
+            out += 1;
         }
-        let normalized = Bytes::from_slice(env, &buf[..end]);
+
+        let normalized = Bytes::from_slice(env, &buf[..out]);
         let hash = env.crypto().sha256(&normalized);
         Ok(hash.to_bytes())
     }
@@ -1459,17 +1520,15 @@ impl HuntyCore {
 
     #[inline]
     fn is_ascii_space(b: u8) -> bool {
-        b.is_ascii_whitespace()
+        // Matches the characters `StringSanitizer` treats as whitespace, so
+        // trimming and collapsing agree.
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r')
     }
 
     fn validate_categories(
         env: &Env,
         categories: Vec<String>,
     ) -> Result<Vec<String>, HuntErrorCode> {
-        if categories.len() > MAX_CATEGORIES_PER_HUNT {
-            return Err(HuntErrorCode::TooManyCategories);
-        }
-
         let mut sanitized = Vec::new(env);
         for i in 0..categories.len() {
             // SAFETY: i is within the vector bounds established by the enclosing loop
@@ -1481,6 +1540,32 @@ impl HuntyCore {
                 false,
             )
             .map_err(|_| HuntErrorCode::InvalidCategory)?;
+
+            // Collapse duplicates after sanitization so that, for example,
+            // ["art", "art", " art "] is a single category. Comparison is
+            // case-sensitive, matching `hunt_has_category`/`get_hunts_by_category`,
+            // so ["art", "Art"] stays two categories. Duplicates must not
+            // consume one of the five slots.
+            let mut duplicate = false;
+            for j in 0..sanitized.len() {
+                // SAFETY: j is within the vector bounds established by the enclosing loop
+                if Self::strings_equal_bounded::<{ MAX_CATEGORY_BYTES as usize }>(
+                    &sanitized.get(j).unwrap(),
+                    &category,
+                ) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if duplicate {
+                continue;
+            }
+
+            // Only distinct categories count towards the cap, so the check has
+            // to happen after de-duplication.
+            if sanitized.len() >= MAX_CATEGORIES_PER_HUNT {
+                return Err(HuntErrorCode::TooManyCategories);
+            }
             sanitized.push_back(category);
         }
         Ok(sanitized)
@@ -1510,7 +1595,13 @@ impl HuntyCore {
             // SAFETY: i is within the vector bounds established by the enclosing loop
             total = total.saturating_add(clues.get(i).unwrap().difficulty);
         }
-        hunt.difficulty_rating = total / clues.len();
+        // Round the mean to the nearest tier instead of truncating it: integer
+        // division would rate a hunt of clues 2, 2, 2, 5 as 2 when the clues
+        // average 2.75. Ties round up (2.5 -> 3). `clues` is non-empty here and
+        // a hunt holds at most MAX_CLUES_PER_HUNT clues of at most difficulty 5,
+        // so the addition cannot overflow.
+        let count = clues.len();
+        hunt.difficulty_rating = (total + count / 2) / count;
     }
 
     fn title_contains(title: &String, needle: &String) -> bool {
@@ -1639,10 +1730,44 @@ impl HuntyCore {
     /// (slowest) tier's amount is used as a fallback. If no tier applies (or
     /// the pool is unreachable), this falls back to the flat
     /// `hunt.reward_config.reward_per_winner()` amount.
+    /// Resolves the flat per-winner amount from the *live* reward pool
+    /// balance at claim time, so sponsor top-ups after activation reach
+    /// later winners. The amount is bounded (see `bounded_flat_amount`)
+    /// so earlier winners can never be shortchanged: it never drops
+    /// below the activation snapshot share (a shrunken pool then fails
+    /// closed downstream instead of silently underpaying), and never
+    /// exceeds the remaining balance.
+    fn resolve_flat_amount(env: &Env, hunt: &Hunt) -> i128 {
+        let snapshot = hunt.reward_config.reward_per_winner();
+        let remaining = hunt
+            .reward_config
+            .max_winners
+            .saturating_sub(hunt.reward_config.claimed_count);
+        let reward_manager_addr = match Storage::get_reward_manager(env) {
+            Some(addr) => addr,
+            None => return snapshot,
+        };
+        let mut args: Vec<Val> = Vec::new(env);
+        args.push_back(hunt.hunt_id.into_val(env));
+        let live_balance: i128 = match env
+            .try_invoke_contract::<i128, RewardErrorCode>(
+                &reward_manager_addr,
+                &Symbol::new(env, "get_pool_balance"),
+                args,
+            )
+            .ok()
+            .and_then(|r| r.ok())
+        {
+            Some(balance) => balance,
+            None => return snapshot,
+        };
+        crate::types::bounded_flat_amount(snapshot, live_balance, remaining)
+    }
+
     fn resolve_reward_amount(env: &Env, hunt: &Hunt, progress: &PlayerProgress) -> i128 {
         let reward_manager_addr = match Storage::get_reward_manager(env) {
             Some(addr) => addr,
-            None => return hunt.reward_config.reward_per_winner(),
+            None => return Self::resolve_flat_amount(env, hunt),
         };
 
         // Fetch pool config from RewardManager. Tiers live there.
@@ -1664,7 +1789,7 @@ impl HuntyCore {
 
         let config = match pool_config.as_ref() {
             Some(config) => config,
-            None => return hunt.reward_config.reward_per_winner(),
+            None => return Self::resolve_flat_amount(env, hunt),
         };
 
         // Rank tiers take precedence over the existing time/flat policy. The
@@ -1682,7 +1807,7 @@ impl HuntyCore {
         let tiers = &config.time_based_tiers;
 
         if tiers.is_empty() {
-            return hunt.reward_config.reward_per_winner();
+            return Self::resolve_flat_amount(env, hunt);
         }
 
         // Compute elapsed time. If started_at is missing, zero selects the smallest tier.
@@ -1690,7 +1815,7 @@ impl HuntyCore {
 
         match reward_interface::resolve_tier_amount(tiers, elapsed) {
             Some(amount) if amount > 0 => amount,
-            _ => hunt.reward_config.reward_per_winner(),
+            _ => Self::resolve_flat_amount(env, hunt),
         }
     }
 
@@ -2051,9 +2176,21 @@ impl HuntyCore {
                 && progress.completion_rank > 0
                 && progress.completion_rank <= hunt.reward_config.max_winners
             {
+                let reward_amount = Self::resolve_reward_amount(&env, &hunt, &progress);
                 match Self::distribute_player_reward(&env, &mut hunt, &mut progress) {
                     Ok(()) => rewarded_players = rewarded_players.saturating_add(1),
-                    Err(_) => unpaid_players.push_back(progress.player.clone()),
+                    Err(_) => {
+                        if let Some(reward_manager) = Storage::get_reward_manager(&env) {
+                            Self::reserve_unpaid_reward(
+                                &env,
+                                &reward_manager,
+                                hunt_id,
+                                &progress.player,
+                                reward_amount,
+                            )?;
+                        }
+                        unpaid_players.push_back(progress.player.clone());
+                    }
                 }
             }
         }
@@ -2350,7 +2487,10 @@ impl HuntyCore {
         // #1100: Pause stops new play, not payouts. Completed players may still
         // claim while Paused. Cancelled pools are refunded; Draft/Completed/
         // Archived/EmergencyStopped hunts reject claims.
-        if hunt.status != HuntStatus::Active && hunt.status != HuntStatus::Paused {
+        if hunt.status != HuntStatus::Active
+            && hunt.status != HuntStatus::Paused
+            && hunt.status != HuntStatus::Completed
+        {
             return Err(HuntErrorCode::InvalidHuntStatus);
         }
 
@@ -2407,6 +2547,66 @@ impl HuntyCore {
     /// # Errors
     /// * `InvalidRarity` - The hunt's configured NFT rarity is out of range
     /// * `RewardDistributionFailed` - The RewardManager cross-contract call failed
+    fn reserve_unpaid_reward(
+        env: &Env,
+        reward_manager: &Address,
+        hunt_id: u64,
+        player: &Address,
+        amount: i128,
+    ) -> Result<(), HuntErrorCode> {
+        if amount <= 0 {
+            return Ok(());
+        }
+
+        let caller = env.current_contract_address();
+        let mut args: Vec<Val> = Vec::new(env);
+        args.push_back(caller.clone().into_val(env));
+        args.push_back(hunt_id.into_val(env));
+        args.push_back(player.clone().into_val(env));
+        args.push_back(amount.into_val(env));
+
+        env.authorize_as_current_contract(soroban_sdk::vec![
+            env,
+            InvokerContractAuthEntry::Contract(SubContractInvocation {
+                context: ContractContext {
+                    contract: reward_manager.clone(),
+                    fn_name: Symbol::new(env, "reserve_unpaid_reward"),
+                    args: args.clone(),
+                },
+                sub_invocations: soroban_sdk::vec![env],
+            }),
+        ]);
+
+        match env.try_invoke_contract::<(), RewardErrorCode>(
+            reward_manager,
+            &Symbol::new(env, "reserve_unpaid_reward"),
+            args,
+        ) {
+            Ok(Ok(())) => Ok(()),
+            _ => Err(HuntErrorCode::RewardDistributionFailed),
+        }
+    }
+
+    fn get_reserved_reward(
+        env: &Env,
+        reward_manager: &Address,
+        hunt_id: u64,
+        player: &Address,
+    ) -> Result<i128, HuntErrorCode> {
+        let mut args: Vec<Val> = Vec::new(env);
+        args.push_back(hunt_id.into_val(env));
+        args.push_back(player.clone().into_val(env));
+
+        match env.try_invoke_contract::<i128, RewardErrorCode>(
+            reward_manager,
+            &Symbol::new(env, "get_reserved_reward"),
+            args,
+        ) {
+            Ok(Ok(amount)) => Ok(amount),
+            _ => Err(HuntErrorCode::RewardDistributionFailed),
+        }
+    }
+
     fn distribute_player_reward(
         env: &Env,
         hunt: &mut Hunt,
@@ -2415,7 +2615,20 @@ impl HuntyCore {
         // ===================== TIER-BASED AMOUNT RESOLUTION =====================
         // Exact completion-rank tiers take precedence, followed by time tiers
         // and finally the hunt's flat per-winner amount.
-        let reward_amount = Self::resolve_reward_amount(env, hunt, progress);
+        let reserved_amount = if hunt.status == HuntStatus::Completed {
+            if let Some(reward_manager) = Storage::get_reward_manager(env) {
+                Self::get_reserved_reward(env, &reward_manager, hunt.hunt_id, &progress.player)?
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        let reward_amount = if reserved_amount > 0 {
+            reserved_amount
+        } else {
+            Self::resolve_reward_amount(env, hunt, progress)
+        };
         // =======================================================================
         let nft_awarded = hunt.reward_config.nft_enabled;
 
@@ -2496,7 +2709,7 @@ impl HuntyCore {
                     InvokerContractAuthEntry::Contract(SubContractInvocation {
                         context: ContractContext {
                             contract: reward_manager_addr.clone(),
-                            fn_name: Symbol::new(env, "distribute_rewards_authorized"),
+                            fn_name: Symbol::new(env, "distribute_rewards"),
                             args: auth_args,
                         },
                         sub_invocations: soroban_sdk::vec![&env],
@@ -2505,7 +2718,7 @@ impl HuntyCore {
 
                 let result = env.try_invoke_contract::<(), RewardErrorCode>(
                     &reward_manager_addr,
-                    &Symbol::new(env, "distribute_rewards_authorized"),
+                    &Symbol::new(env, "distribute_rewards"),
                     args,
                 );
                 match result {
@@ -2814,6 +3027,11 @@ impl HuntyCore {
         }
 
         hunt.is_private = is_private;
+        if !is_private {
+            // Clear the stale code so re-privatizing later cannot
+            // silently re-enable an old (possibly shared) code.
+            hunt.invite_code_hash = None;
+        }
         Storage::save_hunt(&env, &hunt);
 
         let current_time = env.ledger().timestamp();
@@ -3353,6 +3571,10 @@ impl HuntyCore {
         progress.complete_clue(env, clue_id, score)?;
         Self::record_team_clue_completion(env, hunt, player, clue_id, score);
 
+        // Update running score-sum counter so get_hunt_statistics never needs
+        // to iterate player records (O(1) read instead of O(N) scan).
+        Storage::add_hunt_score(env, hunt_id, score);
+
         if hunt.max_submissions_per_minute > 0 {
             progress.recent_submissions = Vec::new(env);
         }
@@ -3370,6 +3592,8 @@ impl HuntyCore {
             let rank = hunt_mut.completed_count;
             Storage::save_hunt(env, &hunt_mut);
             Storage::increment_player_completed_hunt_count(env, player);
+            // Update the per-hunt completion counter used by get_hunt_statistics.
+            Storage::increment_hunt_completed_count(env, hunt_id);
             // Freeze the rank on the player's progress record so it is
             // available as an authoritative value at reward-claim time.
             progress.completion_rank = rank;
@@ -3517,6 +3741,12 @@ impl HuntyCore {
     ///
     /// Shares the incorrect-answer semantics of `submit_answer`: a wrong answer
     /// returns `Ok(false)` and commits the failed attempt.
+    ///
+    /// The hash must be built with exactly the normalization described on
+    /// [`Self::normalize_and_hash_answer`]: outer ASCII whitespace trimmed,
+    /// internal runs collapsed to one space, ASCII `A-Z` lowercased, non-ASCII
+    /// bytes unchanged. Off-chain callers can use the `hashAnswer` helper in
+    /// `bindings/hunty-core`.
     pub fn submit_answer_with_hash(
         env: Env,
         hunt_id: u64,
@@ -3856,7 +4086,7 @@ impl HuntyCore {
             });
         }
 
-        let truncated = entries.len() < total_players;
+        let truncated = entries.len() == MAX_LEADERBOARD_SIZE;
         Ok(LeaderboardResult {
             entries: result,
             total_players,
@@ -4041,24 +4271,18 @@ impl HuntyCore {
 
     /// Returns aggregate statistics for a hunt (read-only): total players, completion rate, average score.
     /// Returns error if hunt does not exist.
+    ///
+    /// All three aggregates are maintained as running counters that are updated
+    /// at clue-completion time, so this function performs three O(1) storage reads
+    /// regardless of how many players are registered. It never loads the player
+    /// list, which would exceed the Soroban read budget on large hunts.
     pub fn get_hunt_statistics(env: Env, hunt_id: u64) -> Result<HuntStatistics, HuntErrorCode> {
         let _ = Storage::get_hunt(&env, hunt_id).ok_or(HuntErrorCode::HuntNotFound)?;
-        let players = Storage::get_hunt_players(&env, hunt_id);
-        let total_players = players.len();
-        let mut completed_count: u32 = 0;
-        let mut total_score_sum: u64 = 0;
-        for i in 0..players.len() {
-            // SAFETY: i is within the vector bounds established by the enclosing loop
-            let p = players.get(i).unwrap();
-            if p.is_completed {
-                completed_count = completed_count
-                    .checked_add(1)
-                    .ok_or(HuntErrorCode::ScoreOverflow)?;
-            }
-            total_score_sum = total_score_sum
-                .checked_add(p.total_score as u64)
-                .ok_or(HuntErrorCode::ScoreOverflow)?;
-        }
+
+        let total_players = Storage::get_player_count(&env, hunt_id);
+        let completed_count = Storage::get_hunt_completed_count(&env, hunt_id);
+        let total_score_sum = Storage::get_hunt_score_sum(&env, hunt_id);
+
         let completion_rate_percent = if total_players > 0 {
             completed_count
                 .checked_mul(100)
@@ -4249,14 +4473,28 @@ impl HuntyCore {
         Storage::set_admin(&env, &new_admin);
         Storage::clear_pending_admin(&env);
 
-        let old_admin_str = old_admin
-            .as_ref()
-            .map(|a| a.to_string())
-            .unwrap_or_else(|| String::from_str(&env, "NONE"));
-
         env.events().publish(
             (Symbol::new(&env, "ADMIN"), Symbol::new(&env, "ADM_TRF")),
-            (old_admin_str, new_admin.to_string()),
+            (old_admin, new_admin),
+        );
+
+        Ok(())
+    }
+
+    /// Cancels a pending admin proposal.
+    ///
+    /// Clears any pending admin address set by `propose_new_admin`, ensuring that
+    /// the previously proposed address can no longer call `accept_admin`.
+    /// Caller must be the current admin.
+    pub fn cancel_admin_proposal(env: Env, admin: Address) -> Result<(), HuntErrorCode> {
+        Self::require_admin(&env, &admin)?;
+
+        let pending = Storage::get_pending_admin(&env).ok_or(HuntErrorCode::NoPendingAdmin)?;
+        Storage::clear_pending_admin(&env);
+
+        env.events().publish(
+            (Symbol::new(&env, "ADMIN"), Symbol::new(&env, "ADM_CNCL")),
+            (admin, pending),
         );
 
         Ok(())
@@ -4362,11 +4600,24 @@ impl HuntyCore {
         target_version: u32,
         wasm_hash: BytesN<32>,
     ) -> Result<hunty_migration::UpgradeProposal, hunty_migration::UpgradeAuthError> {
-        let proposal = migration::HuntyCoreMigration::propose_upgrade(&env, &admin, target_version, wasm_hash)?;
+        let proposal = migration::HuntyCoreMigration::propose_upgrade(
+            &env,
+            &admin,
+            target_version,
+            wasm_hash,
+        )?;
         env.events().publish(
             migration::HuntyCoreMigration::upgrade_proposed_topic(&env),
             migration::HuntyCoreMigration::upgrade_proposed_event(&proposal),
         );
+        Ok(proposal)
+    }
+
+    pub fn cancel_upgrade(
+        env: Env,
+        admin: Address,
+    ) -> Result<hunty_migration::UpgradeProposal, hunty_migration::UpgradeAuthError> {
+        let proposal = migration::HuntyCoreMigration::cancel_upgrade(&env, &admin)?;
         Ok(proposal)
     }
 
@@ -4394,6 +4645,16 @@ impl HuntyCore {
         migration::HuntyCoreMigration::get_upgrade_history(&env, offset, limit)
     }
 
+    /// Returns a page of schema-migration history entries (no wasm_hash —
+    /// migrations are not WASM upgrades).
+    pub fn get_migration_history(
+        env: Env,
+        offset: u32,
+        limit: u32,
+    ) -> soroban_sdk::Vec<hunty_migration::MigrationHistoryEntry> {
+        migration::HuntyCoreMigration::get_migration_history(&env, offset, limit)
+    }
+
     pub fn upgrade(
         env: Env,
         admin: Address,
@@ -4409,7 +4670,21 @@ impl HuntyCore {
         dry_run: bool,
     ) -> Result<migration::MigrationReport, hunty_migration::UpgradeAuthError> {
         admin.require_auth();
-        migration::HuntyCoreMigration::run_migration(&env, &admin, target_version, dry_run)
+        let from_version = migration::HuntyCoreMigration::get_schema_version(&env);
+        let report =
+            migration::HuntyCoreMigration::run_migration(&env, &admin, target_version, dry_run)?;
+        if !dry_run && report.succeeded && report.from_version < report.to_version {
+            env.events().publish(
+                migration::HuntyCoreMigration::migration_executed_topic(&env),
+                migration::HuntyCoreMigration::migration_executed_event(
+                    from_version,
+                    report.to_version,
+                    env.ledger().timestamp(),
+                    admin,
+                ),
+            );
+        }
+        Ok(report)
     }
 
     pub fn rollback_migration(

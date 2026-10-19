@@ -52,3 +52,32 @@ contract.|
 ```
 
 As long as your editor is configured to show JavaScript/TypeScript documentation, you can pause your typing at that `|` to get a list of all exports and inline-documentation for each. It exports a separate [async](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Statements/async_function) function for each method in the smart contract, with documentation for each generated from the comments the contract's author included in the original source code.
+
+# Hashing answers off-chain
+
+`submit_answer_with_hash` takes `SHA256(hunt_id || clue_id || normalized_answer)`
+instead of the plain answer. Use the bundled helper so the hash matches what the
+contract computes in `normalize_and_hash_answer`:
+
+```ts
+import { hashAnswer, normalizeAnswer } from "hunty-core";
+
+// "New   York" normalizes to "new york"; leading/trailing whitespace is
+// trimmed and internal whitespace runs collapse to one space.
+const answerHash = hashAnswer(huntId, clueId, userInput);
+
+await contract.submit_answer_with_hash({
+  hunt_id: huntId,
+  clue_id: clueId,
+  player: playerAddress,
+  answer_hash: answerHash,
+  submission_nonce,
+  submitted_at,
+});
+```
+
+Only ASCII `A-Z` is lowercased. Non-ASCII characters are preserved as-is, so
+`"ÉCOLE"` does not match `"école"`; register such spellings as clue aliases
+with `add_clue_aliases`. `hashAnswer` throws for answers that are empty or
+longer than 256 UTF-8 bytes after normalization, which the contract rejects with
+`InvalidAnswer`.

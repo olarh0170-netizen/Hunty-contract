@@ -1706,6 +1706,7 @@ mod test {
                         points: 10,
                         is_required: true,
                         difficulty: 1,
+                        weight: None,
                     },
                     BatchClueInput {
                         question: String::from_str(env, "Q2"),
@@ -1713,6 +1714,7 @@ mod test {
                         points: 20,
                         is_required: false,
                         difficulty: 3,
+                        weight: None,
                     },
                 ],
             );
@@ -1779,6 +1781,7 @@ mod test {
                         points: 1,
                         is_required: false,
                         difficulty: 1,
+                        weight: None,
                     },
                     BatchClueInput {
                         question: String::from_str(env, "Q101"),
@@ -1786,6 +1789,7 @@ mod test {
                         points: 1,
                         is_required: false,
                         difficulty: 1,
+                        weight: None,
                     },
                 ],
             );
@@ -1843,6 +1847,7 @@ mod test {
                     points: 1,
                     is_required: false,
                     difficulty: 1,
+                    weight: None,
                 }],
             );
 

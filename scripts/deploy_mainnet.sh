@@ -91,14 +91,39 @@ read -r -p "WASM hashes look correct? [yes/no] " CONFIRM
 
 # ── Step 2: Deploy contracts (dependency order) ────────────────────────────────
 declare -A NEW_IDS
+
+# Deploy nft-reward with constructor args: admin, minter, max_supply, metadata
+# (no separate initialize — constructor runs atomically during deploy)
+log "Deploying nft-reward..."
+wasm_path="${WASM_DIR}/nft_reward.wasm"
+wasm_hash=$(stellar contract upload \
+  --wasm "$wasm_path" \
+  --rpc-url "$RPC_URL" \
+  --network-passphrase "$NETWORK_PASSPHRASE" \
+  --source "${SIGNERS[0]}" \
+  2>/dev/null)
+log "  WASM uploaded: $wasm_hash"
+
+NFT_METADATA="{\"name\":\"Hunty NFT Reward\",\"description\":\"Reward NFTs for completed hunts\",\"total_supply\":0,\"creator\":\"$ADMIN_ADDRESS\"}"
+contract_id=$(stellar contract deploy \
+  --wasm-hash "$wasm_hash" \
+  --rpc-url "$RPC_URL" \
+  --network-passphrase "$NETWORK_PASSPHRASE" \
+  --source "${SIGNERS[0]}" \
+  -- "$ADMIN_ADDRESS" "$ADMIN_ADDRESS" "0" "$NFT_METADATA" \
+  2>/dev/null)
+log "  Contract ID  : $contract_id"
+NEW_IDS["nft-reward"]="$contract_id"
+
+# Deploy reward-manager and hunty-core (no constructor args)
 for i in "${!CONTRACTS[@]}"; do
   contract="${CONTRACTS[$i]}"
   wasm_name="${WASM_NAMES[$i]}"
+  [[ "$contract" == "nft-reward" ]] && continue
   wasm_path="${WASM_DIR}/${wasm_name}.wasm"
 
   log "Deploying $contract..."
 
-  # Upload WASM and capture hash
   wasm_hash=$(stellar contract upload \
     --wasm "$wasm_path" \
     --rpc-url "$RPC_URL" \
@@ -108,7 +133,6 @@ for i in "${!CONTRACTS[@]}"; do
 
   log "  WASM uploaded: $wasm_hash"
 
-  # Deploy contract instance
   contract_id=$(stellar contract deploy \
     --wasm-hash "$wasm_hash" \
     --rpc-url "$RPC_URL" \
@@ -139,18 +163,9 @@ for idx in "${!SIGNERS[@]}"; do
   log "Signer ${signer_num} approved."
 done
 
-# ── Step 4: Initialize contracts with admin ────────────────────────────────────
+# ── Step 4: Initialize remaining contracts ───────────────────────────────────
+# nft-reward is initialized via its constructor at deploy time (no initialize call).
 log "Initializing contracts..."
-
-stellar contract invoke \
-  --id "${NEW_IDS[nft-reward]}" \
-  --rpc-url "$RPC_URL" \
-  --network-passphrase "$NETWORK_PASSPHRASE" \
-  --source "${SIGNERS[0]}" \
-  -- initialize \
-  --admin "$ADMIN_ADDRESS"
-
-log "  nft-reward initialized."
 
 stellar contract invoke \
   --id "${NEW_IDS[reward-manager]}" \
@@ -161,7 +176,9 @@ stellar contract invoke \
   --admin "$ADMIN_ADDRESS" \
   --nft_reward_contract "${NEW_IDS[nft-reward]}"
 
-log "  reward-manager initialized."
+# NOTE: `initialize` is a legacy entry point. On constructor-deployed contracts,
+# admin/xlm_token are set at deploy time and `initialize` returns AlreadyInitialized.
+log "  reward-manager initialized (legacy)."
 
 stellar contract invoke \
   --id "${NEW_IDS[hunty-core]}" \

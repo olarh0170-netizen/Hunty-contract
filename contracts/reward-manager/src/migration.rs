@@ -1,7 +1,8 @@
 use crate::storage::Storage;
 use hunty_migration::{
-    MigrationFramework, UpgradeAuthError, UpgradeAuthorization, UpgradeExecutedEvent,
-    UpgradeHistoryEntry, UpgradeProposal, UpgradeProposedEvent, CURRENT_SCHEMA_VERSION,
+    MigrationFramework, UpgradeAuthError, UpgradeAuthorization, UpgradeCancelledEvent,
+    UpgradeExecutedEvent, UpgradeHistoryEntry, UpgradeProposal, UpgradeProposedEvent,
+    CURRENT_SCHEMA_VERSION,
 };
 use soroban_sdk::{Address, BytesN, Env, Symbol};
 
@@ -168,7 +169,7 @@ impl RewardManagerMigration {
     ) -> Result<MigrationReport, UpgradeAuthError> {
         UpgradeAuthorization::require_admin(env, admin, Self::configured_admin(env))?;
         let previous =
-            MigrationFramework::rollback_version(env).ok_or(UpgradeAuthError::NoProposal)?;
+            MigrationFramework::rollback_version(env).ok_or(UpgradeAuthError::NoRollbackPoint)?;
         let current = MigrationFramework::detect_version(env);
         MigrationFramework::set_version(env, previous);
         MigrationFramework::clear_rollback(env);
@@ -209,11 +210,65 @@ impl RewardManagerMigration {
         }
     }
 
+    pub fn migration_executed_event(
+        from_version: u32,
+        to_version: u32,
+        executed_at: u64,
+        executor: Address,
+    ) -> MigrationExecutedEvent {
+        MigrationExecutedEvent {
+            from_version,
+            to_version,
+            executed_at,
+            executor,
+        }
+    }
+
+    pub fn get_migration_history(
+        env: &Env,
+        offset: u32,
+        limit: u32,
+    ) -> soroban_sdk::Vec<MigrationHistoryEntry> {
+        UpgradeAuthorization::get_migration_history(env, offset, limit)
+    }
+
     pub fn upgrade_proposed_topic(env: &Env) -> (Symbol,) {
         (Symbol::new(env, "UpgradeProposed"),)
     }
 
     pub fn upgrade_executed_topic(env: &Env) -> (Symbol,) {
         (Symbol::new(env, "UpgradeExecuted"),)
+    }
+
+    pub fn upgrade_cancelled_topic(env: &Env) -> (Symbol,) {
+        (Symbol::new(env, "UpgradeCancelled"),)
+    }
+
+    pub fn upgrade_cancelled_event(
+        proposal: &UpgradeProposal,
+        cancelled_by: Address,
+        cancelled_at: u64,
+    ) -> UpgradeCancelledEvent {
+        UpgradeCancelledEvent {
+            cancelled_at,
+            proposer: proposal.proposer.clone(),
+            cancelled_by,
+            target_version: proposal.target_version,
+            wasm_hash: proposal.wasm_hash.clone(),
+        }
+    }
+
+    pub fn cancel_upgrade(
+        env: &Env,
+        admin: &Address,
+    ) -> Result<UpgradeProposal, UpgradeAuthError> {
+        UpgradeAuthorization::require_admin(env, admin, Self::configured_admin(env))?;
+        let now = env.ledger().timestamp();
+        let proposal = UpgradeAuthorization::cancel_upgrade(env, admin, Self::configured_admin(env))?;
+        env.events().publish(
+            Self::upgrade_cancelled_topic(env),
+            Self::upgrade_cancelled_event(&proposal, admin.clone(), now),
+        );
+        Ok(proposal)
     }
 }

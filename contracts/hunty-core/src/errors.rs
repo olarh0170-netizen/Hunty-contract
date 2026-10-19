@@ -188,3 +188,23 @@ impl From<HuntError> for HuntErrorCode {
         }
     }
 }
+
+#[cfg(test)]
+mod test {
+    /// Every [`HuntErrorCode`] discriminant must have an entry in the
+    /// published TypeScript bindings (`bindings/hunty-core/src/errors.ts`),
+    /// otherwise clients report an unknown error code.
+    #[test]
+    fn test_bindings_cover_all_hunt_error_codes() {
+        let bindings =
+            include_str!("../../../bindings/hunty-core/src/errors.ts");
+        for code in 1u32..=53 {
+            assert!(
+                bindings.contains(&std::format!("\n  {code}:")),
+                "bindings/hunty-core/src/errors.ts is missing entry for HuntErrorCode {code}",
+            );
+        }
+        assert!(bindings.contains(r#"52: {message:"InviteCodeRequired"}"#));
+        assert!(bindings.contains(r#"53: {message:"TooManyAliases"}"#));
+    }
+}

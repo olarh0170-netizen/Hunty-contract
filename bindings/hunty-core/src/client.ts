@@ -10,6 +10,7 @@ import {
 import type {
   u32,
   u64,
+  i128,
   Option,
 } from "@stellar/stellar-sdk/contract";
 import type {
@@ -17,13 +18,16 @@ import type {
   ClueInfo,
   BatchClueInput,
   ContractHealth,
+  GcReport,
+  HealthAlert,
   HuntStatistics,
   PlayerProgress,
+  RateLimitStatus,
   LeaderboardResult,
   LeaderboardWindow,
   TimeBonusConfig,
 } from "./types.js";
-import type { MigrationReport } from "./reward-types.js";
+import type { MigrationReport, UpgradeHistoryEntry, UpgradeProposal } from "./reward-types.js";
 export interface Client {
   /**
    * Construct and simulate a add_clue transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
@@ -34,7 +38,8 @@ export interface Client {
    * * `env` - The Soroban environment
    * * `hunt_id` - The hunt to add the clue to
    * * `question` - The clue question text (max 2000 chars, non-empty)
-   * * `answer` - Plain-text answer; normalized (trimmed, lowercased) then hashed
+   * * `answer` - Plain-text answer; normalized (trimmed, whitespace-collapsed,
+   *   ASCII-lowercased) then hashed
    * * `points` - Points awarded for solving this clue
    * * `is_required` - Whether this clue must be solved to complete the hunt
    * 
@@ -63,6 +68,9 @@ export interface Client {
    * 
    * The batch is validated against the per-hunt clue cap before writing any new clues,
    * so a request that would exceed the limit fails without partially adding clues.
+   * 
+   * Each [`BatchClueInput`] carries the same optional `weight` as [`Self::add_clue`],
+   * so batch-added clues can be configured exactly like single-clue additions.
    */
   add_clues: ({hunt_id, clues}: {hunt_id: u64, clues: Array<BatchClueInput>}, options?: MethodOptions) => Promise<AssembledTransaction<Result<Array<u32>>>>
 
@@ -638,6 +646,12 @@ export interface Client {
    * This avoids on-chain normalization and hashing when the client supplies
    * the correctly computed `answer_hash = SHA256(hunt_id || clue_id || normalized_answer)`.
    * Use this from off-chain callers that can perform normalization+hashing cheaply.
+   * 
+   * The hash must be built with exactly the normalization described on
+   * [`Self::normalize_and_hash_answer`]: outer ASCII whitespace trimmed,
+   * internal runs collapsed to one space, ASCII `A-Z` lowercased, non-ASCII
+   * bytes unchanged. Off-chain callers can use the `hashAnswer` helper in
+   * `bindings/hunty-core`.
    * Resolves to `true` when the answer is correct and `false` when it is wrong,
    * matching `submit_answer`.
    */
@@ -670,6 +684,203 @@ export interface Client {
    * the rating is the average clue difficulty.
    */
   set_hunt_difficulty_override: ({hunt_id, caller, difficulty_override}: {hunt_id: u64, caller: string, difficulty_override: Option<u32>}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+
+  /**
+   * Construct and simulate a ban_player transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Bans a player from participating in a hunt.
+   * 
+   * # Arguments
+   * * `env` - The Soroban environment
+   * * `hunt_id` - The hunt to ban the player from
+   * * `caller` - The hunt creator or the contract admin
+   * * `player` - The player to ban
+   */
+  ban_player: ({hunt_id, caller, player}: {hunt_id: u64, caller: string, player: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+
+  /**
+   * Construct and simulate a unban_player transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Unbans a player from a hunt.
+   * 
+   * # Arguments
+   * * `env` - The Soroban environment
+   * * `hunt_id` - The hunt to unban the player from
+   * * `caller` - The hunt creator or the contract admin
+   * * `player` - The player to unban
+   */
+  unban_player: ({hunt_id, caller, player}: {hunt_id: u64, caller: string, player: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+
+  /**
+   * Construct and simulate a clone_hunt_with_answers transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Secure clone path that rehashes cloned clues against the new hunt/clue context.
+   * The creator must supply the plaintext answers for each clue in the template.
+   */
+  clone_hunt_with_answers: ({template_hunt_id, caller, answers}: {template_hunt_id: u64, caller: string, answers: Array<string>}, options?: MethodOptions) => Promise<AssembledTransaction<Result<u64>>>
+
+  /**
+   * Construct and simulate a gc_hunt transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Reclaims the storage of a cancelled or archived hunt (issue #446).
+   * 
+   * A cancelled hunt keeps every clue, player-progress, team, leaderboard
+   * and bookkeeping entry it ever wrote. Nothing referenced those entries
+   * any more, but nothing removed them either, so they sat in persistent
+   * storage paying rent until their TTL lapsed.
+   * 
+   * Only `Cancelled` and `Archived` hunts may be collected — those are the
+   * two terminal states. Anything else is rejected with `InvalidHuntStatus`,
+   * because collecting a live hunt would destroy player progress.
+   * 
+   * The sweep is **idempotent**: running it twice reports zero the second
+   * time rather than failing, so an interrupted call is safe to retry.
+   * 
+   * # Authorization
+   * The hunt creator or the contract admin.
+   * 
+   * # Returns
+   * A [`GcReport`] describing what was reclaimed.
+   */
+  gc_hunt: ({hunt_id, caller}: {hunt_id: u64, caller: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<GcReport>>>
+
+  /**
+   * Construct and simulate a get_hunt_storage_footprint transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Reports how much storage a hunt currently occupies, without removing
+   * anything. Read-only, so it needs no authorization — hunt existence and
+   * size are already public via `get_hunt_info`.
+   */
+  get_hunt_storage_footprint: ({hunt_id}: {hunt_id: u64}, options?: MethodOptions) => Promise<AssembledTransaction<GcReport>>
+
+  /**
+   * Construct and simulate a set_reward_config transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Sets the reward configuration for a hunt.
+   * Only the hunt creator (or a co-creator) may do this, and only while the
+   * hunt is still in `Draft` — reward parameters must not be mutable once
+   * players can register (#1012).
+   * Sets nft_image_uri to a placeholder when nft_enabled is true.
+   */
+  set_reward_config: ({hunt_id, max_winners, xlm_pool, nft_enabled, nft_contract, caller}: {hunt_id: u64, max_winners: u32, xlm_pool: i128, nft_enabled: boolean, nft_contract: Option<string>, caller: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+
+  /**
+   * Construct and simulate a set_registration_deadline transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Sets the registration cutoff timestamp for a draft hunt. A value of 0 disables the cutoff.
+   * Only the hunt creator can call this, and only while the hunt is in Draft status.
+   */
+  set_registration_deadline: ({hunt_id, creator, registration_deadline}: {hunt_id: u64, creator: string, registration_deadline: u64}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+
+  /**
+   * Construct and simulate a set_team_mode transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Enables or disables team features for a draft hunt.
+   * Only the hunt creator can call this, and only while the hunt is in Draft status.
+   */
+  set_team_mode: ({hunt_id, creator, team_mode}: {hunt_id: u64, creator: string, team_mode: boolean}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+
+  /**
+   * Construct and simulate a set_allow_partial_scoring transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Enables or disables partial-score claims for a draft hunt.
+   * Only the hunt creator can call this, and only while the hunt is in Draft status.
+   */
+  set_allow_partial_scoring: ({hunt_id, creator, allow_partial_scoring}: {hunt_id: u64, creator: string, allow_partial_scoring: boolean}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+
+  /**
+   * Construct and simulate a set_rate_limit_admin transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Bootstrap or transfer the rate-limit admin role.
+   * 
+   * The first call sets the admin with no prior-admin check. Subsequent
+   * calls require `caller` to already be the stored admin.
+   */
+  set_rate_limit_admin: ({caller, new_admin}: {caller: string, new_admin: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+
+  /**
+   * Construct and simulate a set_creator_hunt_limit transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Admin-only: override the daily hunt-creation limit for a specific creator.
+   * 
+   * Pass `limit = 0` to remove an existing override, falling back to the
+   * contract-wide default.
+   */
+  set_creator_hunt_limit: ({caller, creator, limit}: {caller: string, creator: string, limit: u32}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+
+  /**
+   * Construct and simulate a set_default_hunt_creation_limit transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Admin-only: update the contract-wide default daily hunt-creation limit.
+   * 
+   * This is the fallback used for any creator that has no per-creator
+   * override. The initial value is [`rate_limit::DEFAULT_HUNT_CREATION_LIMIT`].
+   */
+  set_default_hunt_creation_limit: ({caller, limit}: {caller: string, limit: u32}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+
+  /**
+   * Construct and simulate a get_creator_rate_limit_status transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Query the current quota status for a creator.
+   * 
+   * Returns how many hunts the creator has created today, their effective
+   * daily limit, and the cooldown seconds until the next day begins (0 when
+   * the limit has not been reached).
+   */
+  get_creator_rate_limit_status: ({creator}: {creator: string}, options?: MethodOptions) => Promise<AssembledTransaction<RateLimitStatus>>
+
+  /**
+   * Construct and simulate a get_completed_clues_paginated transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Paginated variant of `get_completed_clues` (read-only).
+   * `offset` is 0-indexed; `limit` is capped at `MAX_BATCH_SIZE`, matching
+   * `list_clues`. Returns an empty vec if the player is not registered or the
+   * offset is past the end of the completed set.
+   */
+  get_completed_clues_paginated: ({hunt_id, player, offset, limit}: {hunt_id: u64, player: string, offset: u32, limit: u32}, options?: MethodOptions) => Promise<AssembledTransaction<Array<u32>>>
+
+  /**
+   * Construct and simulate a is_hunt_terminal transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Returns whether the hunt is in a terminal state.
+   * 
+   * A hunt is terminal once it can no longer accept new play or be
+   * reactivated: `Completed`, `Cancelled`, or `Archived`. This view is
+   * consumed by the reward manager to decide whether a pool may be
+   * refunded to its creator.
+   */
+  is_hunt_terminal: ({hunt_id}: {hunt_id: u64}, options?: MethodOptions) => Promise<AssembledTransaction<Result<boolean>>>
+
+  /**
+   * Construct and simulate a is_hunt_expired_or_cancelled transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Returns whether the hunt is expired or cancelled.
+   * 
+   * A hunt is considered expired when it has an `end_time` set and the
+   * current ledger timestamp is at or past that end time. A hunt is
+   * cancelled when its status is `Cancelled`. This view is consumed by the
+   * reward manager to decide whether a pool may be migrated to a new hunt.
+   */
+  is_hunt_expired_or_cancelled: ({hunt_id}: {hunt_id: u64}, options?: MethodOptions) => Promise<AssembledTransaction<Result<boolean>>>
+
+  /**
+   * Construct and simulate a get_active_alerts transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   */
+  get_active_alerts: (options?: MethodOptions) => Promise<AssembledTransaction<Array<HealthAlert>>>
+
+  /**
+   * Construct and simulate a propose_upgrade transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   */
+  propose_upgrade: ({admin, target_version, wasm_hash}: {admin: string, target_version: u32, wasm_hash: Buffer}, options?: MethodOptions) => Promise<AssembledTransaction<Result<UpgradeProposal>>>
+
+  /**
+   * Construct and simulate a upgrade transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   */
+  upgrade: ({admin, new_wasm_hash}: {admin: string, new_wasm_hash: Buffer}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+
+  /**
+   * Construct and simulate a set_upgrade_timelock transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   */
+  set_upgrade_timelock: ({admin, delay_seconds}: {admin: string, delay_seconds: u64}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+
+  /**
+   * Construct and simulate a get_upgrade_proposal transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   */
+  get_upgrade_proposal: (options?: MethodOptions) => Promise<AssembledTransaction<Option<UpgradeProposal>>>
+
+  /**
+   * Construct and simulate a get_upgrade_timelock transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   */
+  get_upgrade_timelock: (options?: MethodOptions) => Promise<AssembledTransaction<u64>>
+
+  /**
+   * Construct and simulate a get_upgrade_history transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   */
+  get_upgrade_history: ({offset, limit}: {offset: u32, limit: u32}, options?: MethodOptions) => Promise<AssembledTransaction<Array<UpgradeHistoryEntry>>>
 
 }
 export class Client extends ContractClient {
@@ -829,6 +1040,29 @@ export class Client extends ContractClient {
         "AAAAAQAAAPpNaXJyb3Igb2YgdGhlIFJld2FyZE1hbmFnZXIncyBwZXItaHVudCBwb29sIGNvbmZpZ3VyYXRpb24uIENhbGxlcnMgc3VjaCBhcwpIdW50eUNvcmUgdXNlIHRoaXMgdG8gZGVzZXJpYWxpemUgYGdldF9wb29sX2NvbmZpZ2AgY3Jvc3MtY29udHJhY3QgcmVzdWx0cy4KRmllbGQgbmFtZXMgYW5kIG9yZGVyIG11c3Qgc3RheSBpbiBzeW5jIHdpdGggdGhlIFJld2FyZE1hbmFnZXIncyBzdHJ1Y3Qgc28KdGhlIFhEUiBlbmNvZGluZ3MgbWF0Y2guAAAAAAAAAAAAEFJld2FyZFBvb2xDb25maWcAAAAMAAAAR1VuaXggdGltZXN0YW1wIGFmdGVyIHdoaWNoIGNsYWltcyBhcmUgbm8gbG9uZ2VyIGFsbG93ZWQgKDAgPSBkaXNhYmxlZCkuAAAAAA5jbGFpbV9kZWFkbGluZQAAAAAABgAAAC9BZGRyZXNzIG9mIHRoZSBodW50IGNyZWF0b3Igd2hvIG93bnMgdGhpcyBwb29sLgAAAAAHY3JlYXRvcgAAAAATAAAANkFkZHJlc3NlcyBhbGxvd2VkIHRvIGRpc3RyaWJ1dGUgcmV3YXJkcyBmb3IgdGhpcyBwb29sLgAAAAAACWRlbGVnYXRlcwAAAAAAA+oAAAATAAAAKkRpc3RyaWJ1dGlvbiBtb2RlIChGaXhlZCBvciBQcm9wb3J0aW9uYWwpLgAAAAAAEWRpc3RyaWJ1dGlvbl9tb2RlAAAAAAAH0AAAABBEaXN0cmlidXRpb25Nb2RlAAAAPFdoZXRoZXIgZGlzdHJpYnV0aW9ucyBmcm9tIHRoaXMgcG9vbCBhcmUgdGVtcG9yYXJpbHkgZnJvemVuLgAAAAZmcm96ZW4AAAAAAAEAAABBTWluaW11bSBYTE0gYW1vdW50IHBlciBkaXN0cmlidXRpb24uIDAgbWVhbnMgbm8gbWluaW11bSBlbmZvcmNlZC4AAAAAAAAXbWluX2Rpc3RyaWJ1dGlvbl9hbW91bnQAAAAACwAAADVNaW5pbXVtIHNlY29uZHMgYmV0d2VlbiBkaXN0cmlidXRpb25zICgwID0gZGlzYWJsZWQpLgAAAAAAAB5taW5fZGlzdHJpYnV0aW9uX2ludGVydmFsX3NlY3MAAAAAAAYAAABBT3B0aW9uYWwgTkZUIGNvbnRyYWN0IGFkZHJlc3MgZm9yIE5GVC1vbmx5IG9yIG1peGVkIHJld2FyZCBwb29scy4AAAAAAAAMbmZ0X2NvbnRyYWN0AAAD6AAAABMAAAA7VGFyZ2V0IGZ1bmRpbmcgYW1vdW50IGZvciBwcm9ncmVzcyB0cmFja2luZyAoMCA9IGRpc2FibGVkKS4AAAAADXRhcmdldF9hbW91bnQAAAAAAAALAAAAbk9wdGlvbmFsIHRpbWUtYmFzZWQgcmV3YXJkIHRpZXJzLiBXaGVuIGVtcHR5LCB0aGUgcGVyLXdpbm5lciBhbW91bnQKaXMgY29tcHV0ZWQgZnJvbSBgeGxtX3Bvb2wgLyBtYXhfd2lubmVyc2AuAAAAAAAQdGltZV9iYXNlZF90aWVycwAAA+oAAAfQAAAAE1RpbWVCYXNlZFJld2FyZFRpZXIAAAAASVRva2VuIGFkZHJlc3MgZm9yIHRoZSByZXdhcmQgcG9vbCAoZS5nLiwgWExNLCBVU0RDLCBvciBvdGhlciBTQUMgdG9rZW5zKS4AAAAAAAANdG9rZW5fYWRkcmVzcwAAAAAAABMAAAEdT3B0aW9uYWwgdmVzdGluZyBwZXJpb2QgaW4gc2Vjb25kcy4gV2hlbiA+IDAsIFhMTSByZXdhcmRzIGFyZSBub3QKdHJhbnNmZXJyZWQgaW1tZWRpYXRlbHkgYXQgZGlzdHJpYnV0aW9uIHRpbWUuIEluc3RlYWQsIGEgYFZlc3RpbmdSZWNvcmRgCmlzIGNyZWF0ZWQgYW5kIHRoZSBwbGF5ZXIgbXVzdCBjYWxsIGBjbGFpbV92ZXN0ZWRgIHRvIHJlY2VpdmUgdG9rZW5zCnByb3BvcnRpb25hbGx5IGFzIHRpbWUgZWxhcHNlcy4gMCBtZWFucyB2ZXN0aW5nIGlzIGRpc2FibGVkIChpbnN0YW50IHBheW91dCkuAAAAAAAAE3Zlc3RpbmdfcGVyaW9kX3NlY3MAAAAABg==",
         "AAAAAQAAAi5PbmUgdGllciBvZiBhIHRpbWUtYmFzZWQgcmV3YXJkIHNjaGVkdWxlIGNvbmZpZ3VyZWQgb24gYSByZXdhcmQgcG9vbC4KCkEgdGllciBkZWZpbmVzIGFuIFhMTSBhbW91bnQgdGhhdCBpcyBncmFudGVkIHRvIGEgcGxheWVyIHdobyBjb21wbGV0ZXMgdGhlCmh1bnQgd2l0aGluIGBtYXhfY29tcGxldGlvbl9zZWNzYCBvZiByZWdpc3RlcmluZy4gVGllcnMgbXVzdCBiZSBzdG9yZWQgaW4KYXNjZW5kaW5nIG9yZGVyIGJ5IGBtYXhfY29tcGxldGlvbl9zZWNzYCDigJQgaS5lLiBhICJmYXN0ZXIiIHRpZXIgbXVzdAphcHBlYXIgYmVmb3JlIGEgInNsb3dlciIgdGllci4gVGhlIGZpcnN0IHRpZXIgZm9yIHdoaWNoCmBtYXhfY29tcGxldGlvbl9zZWNzID49IGVsYXBzZWRgIGlzIHNlbGVjdGVkIGF0IGRpc3RyaWJ1dGlvbiB0aW1lOyBpZiB0aGUKZWxhcHNlZCB0aW1lIGV4Y2VlZHMgZXZlcnkgY29uZmlndXJlZCB0aWVyLCB0aGUgbGFzdCAoc2xvd2VzdCkgdGllcidzCmFtb3VudCBpcyB1c2VkIGFzIGEgZmFsbGJhY2sgc28gdGhlIHBsYXllciBzdGlsbCByZWNlaXZlcyBhIHJld2FyZC4AAAAAAAAAAAATVGltZUJhc2VkUmV3YXJkVGllcgAAAAACAAAAiUluY2x1c2l2ZSB1cHBlciBib3VuZCBvbiBlbGFwc2VkIHRpbWUgKGNvbXBsZXRpb25fdGltZSAtIHJlZ2lzdHJhdGlvbl90aW1lKQppbiBzZWNvbmRzLiBNdXN0IGJlIHN0cmljdGx5IGluY3JlYXNpbmcgYWNyb3NzIHRoZSB0aWVyIGxpc3QuAAAAAAAAE21heF9jb21wbGV0aW9uX3NlY3MAAAAABgAAADtYTE0gYW1vdW50IGF3YXJkZWQgdG8gYSBwbGF5ZXIgd2hvIHF1YWxpZmllcyBmb3IgdGhpcyB0aWVyLgAAAAAKeGxtX2Ftb3VudAAAAAAACw==",
         "AAAABAAAAAAAAAAAAAAAD1Jld2FyZEVycm9yQ29kZQAAAAAWAAAAAAAAAA5Ob3RJbml0aWFsaXplZAAAAAAAAQAAAAAAAAAQSW5zdWZmaWNpZW50UG9vbAAAAAIAAAAAAAAAEkFscmVhZHlEaXN0cmlidXRlZAAAAAAAAwAAAAAAAAAOVHJhbnNmZXJGYWlsZWQAAAAAAAQAAAAAAAAADUludmFsaWRBbW91bnQAAAAAAAAFAAAAAAAAAA1JbnZhbGlkQ29uZmlnAAAAAAAABgAAAAAAAAANTmZ0TWludEZhaWxlZAAAAAAAAAcAAAAAAAAAEVBvb2xBbHJlYWR5RXhpc3RzAAAAAAAACAAAAAAAAAAMUG9vbE5vdEZvdW5kAAAACQAAAAAAAAAMVW5hdXRob3JpemVkAAAACgAAAAAAAAASQmVsb3dNaW5pbXVtQW1vdW50AAAAAAALAAAAAAAAABJBbHJlYWR5SW5pdGlhbGl6ZWQAAAAAAAwAAAAAAAAADEh1bnROb3RGb3VuZAAAAA0AAABRQSByZWN1cnNpdmUgZGlzdHJpYnV0aW9uIGF0dGVtcHQgd2FzIGRldGVjdGVkIGR1cmluZyBhbiBleHRlcm5hbCBYTE0gb3IgTkZUIGNhbGwuAAAAAAAAElJlZW50cmFuY3lEZXRlY3RlZAAAAAAADgAAAERUaGUgdHJhY2tlZCBwb29sIGJhbGFuY2UgZGl2ZXJnZWQgZnJvbSB0aGUgYWN0dWFsIFhMTSB0b2tlbiBiYWxhbmNlLgAAABVQb29sQmFsYW5jZURpdmVyZ2VuY2UAAAAAAAAPAAAAWlBvb2wgYmFsYW5jZSB3b3VsZCBvdmVyZmxvdyBpZiB0aGlzIGZ1bmRpbmcgYW1vdW50IGlzIGFkZGVkIChwb29sIGJhbGFuY2UgbGltaXQgZXhjZWVkZWQpLgAAAAAAE1Bvb2xCYWxhbmNlT3ZlcmZsb3cAAAAAEAAAAEZGdW5kaW5nIGFtb3VudCBpcyBiZWxvdyB0aGUgbWluaW11bSByZXF1aXJlZCAoZHVzdCBhdHRhY2sgcHJldmVudGlvbikuAAAAAAATQmVsb3dNaW5pbXVtRnVuZGluZwAAAAARAAAAOEZ1bmRpbmcgYW1vdW50IGV4Y2VlZHMgdGhlIG1heGltdW0gc2luZ2xlIGZ1bmRpbmcgbGltaXQuAAAAFUV4Y2VlZHNNYXhpbXVtRnVuZGluZwAAAAAAABIAAAA9RGFpbHkgZGlzdHJpYnV0aW9uIGNhcCBmb3IgYSBzcGVjaWZpYyBwb29sIGhhcyBiZWVuIGV4Y2VlZGVkLgAAAAAAABBEYWlseUNhcEV4Y2VlZGVkAAAAEwAAADBHbG9iYWwgZGFpbHkgZGlzdHJpYnV0aW9uIGNhcCBoYXMgYmVlbiBleGNlZWRlZC4AAAAWR2xvYmFsRGFpbHlDYXBFeGNlZWRlZAAAAAAAFAAAADFDb250cmFjdCBpcyBwYXVzZWQgYW5kIGNhbm5vdCBwZXJmb3JtIG9wZXJhdGlvbnMuAAAAAAAADkNvbnRyYWN0UGF1c2VkAAAAAAAVAAAAHEVtZXJnZW5jeSB3aXRoZHJhd2FsIGZhaWxlZC4AAAAZRW1lcmdlbmN5V2l0aGRyYXdhbEZhaWxlZAAAAAAAABY=" ]),
+        "AAAAAAAAANtCYW5zIGEgcGxheWVyIGZyb20gcGFydGljaXBhdGluZyBpbiBhIGh1bnQuCgojIEFyZ3VtZW50cwoqIGBlbnZgIC0gVGhlIFNvcm9iYW4gZW52aXJvbm1lbnQKKiBgaHVudF9pZGAgLSBUaGUgaHVudCB0byBiYW4gdGhlIHBsYXllciBmcm9tCiogYGNhbGxlcmAgLSBUaGUgaHVudCBjcmVhdG9yIG9yIHRoZSBjb250cmFjdCBhZG1pbgoqIGBwbGF5ZXJgIC0gVGhlIHBsYXllciB0byBiYW4AAAAACmJhbl9wbGF5ZXIAAAAAAAMAAAAAAAAAB2h1bnRfaWQAAAAABgAAAAAAAAAGY2FsbGVyAAAAAAATAAAAAAAAAAZwbGF5ZXIAAAAAABMAAAABAAAD6QAAAAIAAAfQAAAADUh1bnRFcnJvckNvZGUAAAA=",
+        "AAAAAAAAANBVbmJhbnMgYSBwbGF5ZXIgZnJvbSBhIGh1bnQuCgojIEFyZ3VtZW50cwoqIGBlbnZgIC0gVGhlIFNvcm9iYW4gZW52aXJvbm1lbnQKKiBgaHVudF9pZGAgLSBUaGUgaHVudCB0byB1bmJhbiB0aGUgcGxheWVyIGZyb20KKiBgY2FsbGVyYCAtIFRoZSBodW50IGNyZWF0b3Igb3IgdGhlIGNvbnRyYWN0IGFkbWluCiogYHBsYXllcmAgLSBUaGUgcGxheWVyIHRvIHVuYmFuAAAADHVuYmFuX3BsYXllcgAAAAMAAAAAAAAAB2h1bnRfaWQAAAAABgAAAAAAAAAGY2FsbGVyAAAAAAATAAAAAAAAAAZwbGF5ZXIAAAAAABMAAAABAAAD6QAAAAIAAAfQAAAADUh1bnRFcnJvckNvZGUAAAA=",
+        "AAAAAAAAAJxTZWN1cmUgY2xvbmUgcGF0aCB0aGF0IHJlaGFzaGVzIGNsb25lZCBjbHVlcyBhZ2FpbnN0IHRoZSBuZXcgaHVudC9jbHVlIGNvbnRleHQuClRoZSBjcmVhdG9yIG11c3Qgc3VwcGx5IHRoZSBwbGFpbnRleHQgYW5zd2VycyBmb3IgZWFjaCBjbHVlIGluIHRoZSB0ZW1wbGF0ZS4AAAAXY2xvbmVfaHVudF93aXRoX2Fuc3dlcnMAAAAAAwAAAAAAAAAQdGVtcGxhdGVfaHVudF9pZAAAAAYAAAAAAAAABmNhbGxlcgAAAAAAEwAAAAAAAAAHYW5zd2VycwAAAAPqAAAAEAAAAAEAAAPpAAAABgAAB9AAAAANSHVudEVycm9yQ29kZQAAAA==",
+        "AAAAAAAAAw1SZWNsYWltcyB0aGUgc3RvcmFnZSBvZiBhIGNhbmNlbGxlZCBvciBhcmNoaXZlZCBodW50IChpc3N1ZSAjNDQ2KS4KCkEgY2FuY2VsbGVkIGh1bnQga2VlcHMgZXZlcnkgY2x1ZSwgcGxheWVyLXByb2dyZXNzLCB0ZWFtLCBsZWFkZXJib2FyZAphbmQgYm9va2tlZXBpbmcgZW50cnkgaXQgZXZlciB3cm90ZS4gTm90aGluZyByZWZlcmVuY2VkIHRob3NlIGVudHJpZXMKYW55IG1vcmUsIGJ1dCBub3RoaW5nIHJlbW92ZWQgdGhlbSBlaXRoZXIsIHNvIHRoZXkgc2F0IGluIHBlcnNpc3RlbnQKc3RvcmFnZSBwYXlpbmcgcmVudCB1bnRpbCB0aGVpciBUVEwgbGFwc2VkLgoKT25seSBgQ2FuY2VsbGVkYCBhbmQgYEFyY2hpdmVkYCBodW50cyBtYXkgYmUgY29sbGVjdGVkIOKAlCB0aG9zZSBhcmUgdGhlCnR3byB0ZXJtaW5hbCBzdGF0ZXMuIEFueXRoaW5nIGVsc2UgaXMgcmVqZWN0ZWQgd2l0aCBgSW52YWxpZEh1bnRTdGF0dXNgLApiZWNhdXNlIGNvbGxlY3RpbmcgYSBsaXZlIGh1bnQgd291bGQgZGVzdHJveSBwbGF5ZXIgcHJvZ3Jlc3MuCgpUaGUgc3dlZXAgaXMgKippZGVtcG90ZW50Kio6IHJ1bm5pbmcgaXQgdHdpY2UgcmVwb3J0cyB6ZXJvIHRoZSBzZWNvbmQKdGltZSByYXRoZXIgdGhhbiBmYWlsaW5nLCBzbyBhbiBpbnRlcnJ1cHRlZCBjYWxsIGlzIHNhZmUgdG8gcmV0cnkuCgojIEF1dGhvcml6YXRpb24KVGhlIGh1bnQgY3JlYXRvciBvciB0aGUgY29udHJhY3QgYWRtaW4uCgojIFJldHVybnMKQSBbYEdjUmVwb3J0YF0gZGVzY3JpYmluZyB3aGF0IHdhcyByZWNsYWltZWQuAAAAAAAAB2djX2h1bnQAAAAAAgAAAAAAAAAHaHVudF9pZAAAAAAGAAAAAAAAAAZjYWxsZXIAAAAAABMAAAABAAAD6QAAB9AAAAAIR2NSZXBvcnQAAAfQAAAADUh1bnRFcnJvckNvZGUAAAA=",
+        "AAAAAAAAALpSZXBvcnRzIGhvdyBtdWNoIHN0b3JhZ2UgYSBodW50IGN1cnJlbnRseSBvY2N1cGllcywgd2l0aG91dCByZW1vdmluZwphbnl0aGluZy4gUmVhZC1vbmx5LCBzbyBpdCBuZWVkcyBubyBhdXRob3JpemF0aW9uIOKAlCBodW50IGV4aXN0ZW5jZSBhbmQKc2l6ZSBhcmUgYWxyZWFkeSBwdWJsaWMgdmlhIGBnZXRfaHVudF9pbmZvYC4AAAAAABpnZXRfaHVudF9zdG9yYWdlX2Zvb3RwcmludAAAAAAAAQAAAAAAAAAHaHVudF9pZAAAAAAGAAAAAQAAB9AAAAAIR2NSZXBvcnQ=",
+        "AAAAAAAAARVTZXRzIHRoZSByZXdhcmQgY29uZmlndXJhdGlvbiBmb3IgYSBodW50LgpPbmx5IHRoZSBodW50IGNyZWF0b3IgKG9yIGEgY28tY3JlYXRvcikgbWF5IGRvIHRoaXMsIGFuZCBvbmx5IHdoaWxlIHRoZQpodW50IGlzIHN0aWxsIGluIGBEcmFmdGAg4oCUIHJld2FyZCBwYXJhbWV0ZXJzIG11c3Qgbm90IGJlIG11dGFibGUgb25jZQpwbGF5ZXJzIGNhbiByZWdpc3RlciAoIzEwMTIpLgpTZXRzIG5mdF9pbWFnZV91cmkgdG8gYSBwbGFjZWhvbGRlciB3aGVuIG5mdF9lbmFibGVkIGlzIHRydWUuAAAAAAAAEXNldF9yZXdhcmRfY29uZmlnAAAAAAAABgAAAAAAAAAHaHVudF9pZAAAAAAGAAAAAAAAAAttYXhfd2lubmVycwAAAAAEAAAAAAAAAAh4bG1fcG9vbAAAAAsAAAAAAAAAC25mdF9lbmFibGVkAAAAAAEAAAAAAAAADG5mdF9jb250cmFjdAAAA+gAAAATAAAAAAAAAAZjYWxsZXIAAAAAABMAAAABAAAD6QAAAAIAAAfQAAAADUh1bnRFcnJvckNvZGUAAAA=",
+        "AAAAAAAAAKtTZXRzIHRoZSByZWdpc3RyYXRpb24gY3V0b2ZmIHRpbWVzdGFtcCBmb3IgYSBkcmFmdCBodW50LiBBIHZhbHVlIG9mIDAgZGlzYWJsZXMgdGhlIGN1dG9mZi4KT25seSB0aGUgaHVudCBjcmVhdG9yIGNhbiBjYWxsIHRoaXMsIGFuZCBvbmx5IHdoaWxlIHRoZSBodW50IGlzIGluIERyYWZ0IHN0YXR1cy4AAAAAGXNldF9yZWdpc3RyYXRpb25fZGVhZGxpbmUAAAAAAAADAAAAAAAAAAdodW50X2lkAAAAAAYAAAAAAAAAB2NyZWF0b3IAAAAAEwAAAAAAAAAVcmVnaXN0cmF0aW9uX2RlYWRsaW5lAAAAAAAABgAAAAEAAAPpAAAAAgAAB9AAAAANSHVudEVycm9yQ29kZQAAAA==",
+        "AAAAAAAAAIRFbmFibGVzIG9yIGRpc2FibGVzIHRlYW0gZmVhdHVyZXMgZm9yIGEgZHJhZnQgaHVudC4KT25seSB0aGUgaHVudCBjcmVhdG9yIGNhbiBjYWxsIHRoaXMsIGFuZCBvbmx5IHdoaWxlIHRoZSBodW50IGlzIGluIERyYWZ0IHN0YXR1cy4AAAANc2V0X3RlYW1fbW9kZQAAAAAAAAMAAAAAAAAAB2h1bnRfaWQAAAAABgAAAAAAAAAHY3JlYXRvcgAAAAATAAAAAAAAAAl0ZWFtX21vZGUAAAAAAAABAAAAAQAAA+kAAAACAAAH0AAAAA1IdW50RXJyb3JDb2RlAAAA",
+        "AAAAAAAAAItFbmFibGVzIG9yIGRpc2FibGVzIHBhcnRpYWwtc2NvcmUgY2xhaW1zIGZvciBhIGRyYWZ0IGh1bnQuCk9ubHkgdGhlIGh1bnQgY3JlYXRvciBjYW4gY2FsbCB0aGlzLCBhbmQgb25seSB3aGlsZSB0aGUgaHVudCBpcyBpbiBEcmFmdCBzdGF0dXMuAAAAABlzZXRfYWxsb3dfcGFydGlhbF9zY29yaW5nAAAAAAAAAwAAAAAAAAAHaHVudF9pZAAAAAAGAAAAAAAAAAdjcmVhdG9yAAAAABMAAAAAAAAAFWFsbG93X3BhcnRpYWxfc2NvcmluZwAAAAAAAAEAAAABAAAD6QAAAAIAAAfQAAAADUh1bnRFcnJvckNvZGUAAAA=",
+        "AAAAAAAAAKxCb290c3RyYXAgb3IgdHJhbnNmZXIgdGhlIHJhdGUtbGltaXQgYWRtaW4gcm9sZS4KClRoZSBmaXJzdCBjYWxsIHNldHMgdGhlIGFkbWluIHdpdGggbm8gcHJpb3ItYWRtaW4gY2hlY2suIFN1YnNlcXVlbnQKY2FsbHMgcmVxdWlyZSBgY2FsbGVyYCB0byBhbHJlYWR5IGJlIHRoZSBzdG9yZWQgYWRtaW4uAAAAFHNldF9yYXRlX2xpbWl0X2FkbWluAAAAAgAAAAAAAAAGY2FsbGVyAAAAAAATAAAAAAAAAAluZXdfYWRtaW4AAAAAAAATAAAAAQAAA+kAAAACAAAH0AAAAA1IdW50RXJyb3JDb2RlAAAA",
+        "AAAAAAAAAKdBZG1pbi1vbmx5OiBvdmVycmlkZSB0aGUgZGFpbHkgaHVudC1jcmVhdGlvbiBsaW1pdCBmb3IgYSBzcGVjaWZpYyBjcmVhdG9yLgoKUGFzcyBgbGltaXQgPSAwYCB0byByZW1vdmUgYW4gZXhpc3Rpbmcgb3ZlcnJpZGUsIGZhbGxpbmcgYmFjayB0byB0aGUKY29udHJhY3Qtd2lkZSBkZWZhdWx0LgAAAAAWc2V0X2NyZWF0b3JfaHVudF9saW1pdAAAAAAAAwAAAAAAAAAGY2FsbGVyAAAAAAATAAAAAAAAAAdjcmVhdG9yAAAAABMAAAAAAAAABWxpbWl0AAAAAAAABAAAAAEAAAPpAAAAAgAAB9AAAAANSHVudEVycm9yQ29kZQAAAA==",
+        "AAAAAAAAANZBZG1pbi1vbmx5OiB1cGRhdGUgdGhlIGNvbnRyYWN0LXdpZGUgZGVmYXVsdCBkYWlseSBodW50LWNyZWF0aW9uIGxpbWl0LgoKVGhpcyBpcyB0aGUgZmFsbGJhY2sgdXNlZCBmb3IgYW55IGNyZWF0b3IgdGhhdCBoYXMgbm8gcGVyLWNyZWF0b3IKb3ZlcnJpZGUuIFRoZSBpbml0aWFsIHZhbHVlIGlzIFtgcmF0ZV9saW1pdDo6REVGQVVMVF9IVU5UX0NSRUFUSU9OX0xJTUlUYF0uAAAAAAAfc2V0X2RlZmF1bHRfaHVudF9jcmVhdGlvbl9saW1pdAAAAAACAAAAAAAAAAZjYWxsZXIAAAAAABMAAAAAAAAABWxpbWl0AAAAAAAABAAAAAEAAAPpAAAAAgAAB9AAAAANSHVudEVycm9yQ29kZQAAAA==",
+        "AAAAAAAAAN1RdWVyeSB0aGUgY3VycmVudCBxdW90YSBzdGF0dXMgZm9yIGEgY3JlYXRvci4KClJldHVybnMgaG93IG1hbnkgaHVudHMgdGhlIGNyZWF0b3IgaGFzIGNyZWF0ZWQgdG9kYXksIHRoZWlyIGVmZmVjdGl2ZQpkYWlseSBsaW1pdCwgYW5kIHRoZSBjb29sZG93biBzZWNvbmRzIHVudGlsIHRoZSBuZXh0IGRheSBiZWdpbnMgKDAgd2hlbgp0aGUgbGltaXQgaGFzIG5vdCBiZWVuIHJlYWNoZWQpLgAAAAAAAB1nZXRfY3JlYXRvcl9yYXRlX2xpbWl0X3N0YXR1cwAAAAAAAAEAAAAAAAAAB2NyZWF0b3IAAAAAEwAAAAEAAAfQAAAAD1JhdGVMaW1pdFN0YXR1cwA=",
+        "AAAAAAAAAPVQYWdpbmF0ZWQgdmFyaWFudCBvZiBgZ2V0X2NvbXBsZXRlZF9jbHVlc2AgKHJlYWQtb25seSkuCmBvZmZzZXRgIGlzIDAtaW5kZXhlZDsgYGxpbWl0YCBpcyBjYXBwZWQgYXQgYE1BWF9CQVRDSF9TSVpFYCwgbWF0Y2hpbmcKYGxpc3RfY2x1ZXNgLiBSZXR1cm5zIGFuIGVtcHR5IHZlYyBpZiB0aGUgcGxheWVyIGlzIG5vdCByZWdpc3RlcmVkIG9yIHRoZQpvZmZzZXQgaXMgcGFzdCB0aGUgZW5kIG9mIHRoZSBjb21wbGV0ZWQgc2V0LgAAAAAAAB1nZXRfY29tcGxldGVkX2NsdWVzX3BhZ2luYXRlZAAAAAAAAAQAAAAAAAAAB2h1bnRfaWQAAAAABgAAAAAAAAAGcGxheWVyAAAAAAATAAAAAAAAAAZvZmZzZXQAAAAAAAQAAAAAAAAABWxpbWl0AAAAAAAABAAAAAEAAAPqAAAABA==",
+        "AAAAAAAAAQtSZXR1cm5zIHdoZXRoZXIgdGhlIGh1bnQgaXMgaW4gYSB0ZXJtaW5hbCBzdGF0ZS4KCkEgaHVudCBpcyB0ZXJtaW5hbCBvbmNlIGl0IGNhbiBubyBsb25nZXIgYWNjZXB0IG5ldyBwbGF5IG9yIGJlCnJlYWN0aXZhdGVkOiBgQ29tcGxldGVkYCwgYENhbmNlbGxlZGAsIG9yIGBBcmNoaXZlZGAuIFRoaXMgdmlldyBpcwpjb25zdW1lZCBieSB0aGUgcmV3YXJkIG1hbmFnZXIgdG8gZGVjaWRlIHdoZXRoZXIgYSBwb29sIG1heSBiZQpyZWZ1bmRlZCB0byBpdHMgY3JlYXRvci4AAAAAEGlzX2h1bnRfdGVybWluYWwAAAABAAAAAAAAAAdodW50X2lkAAAAAAYAAAABAAAD6QAAAAEAAAfQAAAADUh1bnRFcnJvckNvZGUAAAA=",
+        "AAAAAAAAAUNSZXR1cm5zIHdoZXRoZXIgdGhlIGh1bnQgaXMgZXhwaXJlZCBvciBjYW5jZWxsZWQuCgpBIGh1bnQgaXMgY29uc2lkZXJlZCBleHBpcmVkIHdoZW4gaXQgaGFzIGFuIGBlbmRfdGltZWAgc2V0IGFuZCB0aGUKY3VycmVudCBsZWRnZXIgdGltZXN0YW1wIGlzIGF0IG9yIHBhc3QgdGhhdCBlbmQgdGltZS4gQSBodW50IGlzCmNhbmNlbGxlZCB3aGVuIGl0cyBzdGF0dXMgaXMgYENhbmNlbGxlZGAuIFRoaXMgdmlldyBpcyBjb25zdW1lZCBieSB0aGUKcmV3YXJkIG1hbmFnZXIgdG8gZGVjaWRlIHdoZXRoZXIgYSBwb29sIG1heSBiZSBtaWdyYXRlZCB0byBhIG5ldyBodW50LgAAAAAcaXNfaHVudF9leHBpcmVkX29yX2NhbmNlbGxlZAAAAAEAAAAAAAAAB2h1bnRfaWQAAAAABgAAAAEAAAPpAAAAAQAAB9AAAAANSHVudEVycm9yQ29kZQAAAA==",
+        "AAAAAAAAAAAAAAARZ2V0X2FjdGl2ZV9hbGVydHMAAAAAAAAAAAAAAQAAA+oAAAfQAAAAC0hlYWx0aEFsZXJ0AA==",
+        "AAAAAAAAAAAAAAAPcHJvcG9zZV91cGdyYWRlAAAAAAMAAAAAAAAABWFkbWluAAAAAAAAEwAAAAAAAAAOdGFyZ2V0X3ZlcnNpb24AAAAAAAQAAAAAAAAACXdhc21faGFzaAAAAAAAA+4AAAAgAAAAAQAAA+kAAAfQAAAAD1VwZ3JhZGVQcm9wb3NhbAAAAAfQAAAAEFVwZ3JhZGVBdXRoRXJyb3I=",
+        "AAAAAAAAAAAAAAAHdXBncmFkZQAAAAACAAAAAAAAAAVhZG1pbgAAAAAAABMAAAAAAAAADW5ld193YXNtX2hhc2gAAAAAAAPuAAAAIAAAAAEAAAPpAAAAAgAAB9AAAAAQVXBncmFkZUF1dGhFcnJvcg==",
+        "AAAAAAAAAAAAAAAUc2V0X3VwZ3JhZGVfdGltZWxvY2sAAAACAAAAAAAAAAVhZG1pbgAAAAAAABMAAAAAAAAADWRlbGF5X3NlY29uZHMAAAAAAAAGAAAAAQAAA+kAAAACAAAH0AAAABBVcGdyYWRlQXV0aEVycm9y",
+        "AAAAAAAAAAAAAAAUZ2V0X3VwZ3JhZGVfcHJvcG9zYWwAAAAAAAAAAQAAA+gAAAfQAAAAD1VwZ3JhZGVQcm9wb3NhbAA=",
+        "AAAAAAAAAAAAAAAUZ2V0X3VwZ3JhZGVfdGltZWxvY2sAAAAAAAAAAQAAAAY=",
+        "AAAAAAAAAAAAAAATZ2V0X3VwZ3JhZGVfaGlzdG9yeQAAAAACAAAAAAAAAAZvZmZzZXQAAAAAAAQAAAAAAAAABWxpbWl0AAAAAAAABAAAAAEAAAPqAAAH0AAAABNVcGdyYWRlSGlzdG9yeUVudHJ5AA==",
       options
     )
   }
@@ -907,5 +1141,28 @@ export class Client extends ContractClient {
         get_global_view_only_list: this.txFromJSON<Array<string>>,
         get_hunt_leaderboard_window: this.txFromJSON<Result<LeaderboardWindow>>,
         set_hunt_difficulty_override: this.txFromJSON<Result<void>>
+        ban_player: this.txFromJSON<Result<void>>,
+        unban_player: this.txFromJSON<Result<void>>,
+        clone_hunt_with_answers: this.txFromJSON<Result<u64>>,
+        gc_hunt: this.txFromJSON<Result<GcReport>>,
+        get_hunt_storage_footprint: this.txFromJSON<GcReport>,
+        set_reward_config: this.txFromJSON<Result<void>>,
+        set_registration_deadline: this.txFromJSON<Result<void>>,
+        set_team_mode: this.txFromJSON<Result<void>>,
+        set_allow_partial_scoring: this.txFromJSON<Result<void>>,
+        set_rate_limit_admin: this.txFromJSON<Result<void>>,
+        set_creator_hunt_limit: this.txFromJSON<Result<void>>,
+        set_default_hunt_creation_limit: this.txFromJSON<Result<void>>,
+        get_creator_rate_limit_status: this.txFromJSON<RateLimitStatus>,
+        get_completed_clues_paginated: this.txFromJSON<Array<u32>>,
+        is_hunt_terminal: this.txFromJSON<Result<boolean>>,
+        is_hunt_expired_or_cancelled: this.txFromJSON<Result<boolean>>,
+        get_active_alerts: this.txFromJSON<Array<HealthAlert>>,
+        propose_upgrade: this.txFromJSON<Result<UpgradeProposal>>,
+        upgrade: this.txFromJSON<Result<void>>,
+        set_upgrade_timelock: this.txFromJSON<Result<void>>,
+        get_upgrade_proposal: this.txFromJSON<Option<UpgradeProposal>>,
+        get_upgrade_timelock: this.txFromJSON<u64>,
+        get_upgrade_history: this.txFromJSON<Array<UpgradeHistoryEntry>>
   }
 }

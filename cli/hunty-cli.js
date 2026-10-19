@@ -8,12 +8,12 @@ Hunty CLI Tool
 Usage: node hunty-cli.js <command> [options]
 
 Commands:
-  create-hunt     --name <name> --start <timestamp> --end <timestamp> --creator <address>
+  create-hunt     --title <title> --description <desc> --start <timestamp> --end <timestamp> --creator <address> [--max-submissions-per-minute <n> --start-multiplier-bps <bps> --default-points <n>]
   add-clue        --hunt <hunt_id> --answer <answer> --points <points>
   activate        --hunt <hunt_id> --caller <address>
   register        --hunt <hunt_id> --player <address>
-  submit-answer   --hunt <hunt_id> --clue <clue_id> --answer <answer> --player <address>
-  leaderboard     --hunt <hunt_id>
+  submit-answer   --hunt <hunt_id> --clue <clue_id> --answer <answer> --player <address> [--nonce <n> --submitted-at <timestamp>]
+  leaderboard     --hunt <hunt_id> [--limit <n>]
   player-stats    --hunt <hunt_id> --player <address>
   pause           --admin <address>
   unpause         --admin <address>
@@ -38,6 +38,30 @@ function parseArgs(args) {
   return result;
 }
 
+const SENSITIVE_KEYS = new Set([
+  'answer',
+  'invite_code',
+  'invite-code',
+  'secret',
+  'password',
+  'private_key',
+  'private-key',
+  'mnemonic',
+  'seed',
+]);
+
+function redactArgs(args) {
+  const redacted = [];
+  for (let i = 0; i < args.length; i++) {
+    redacted.push(args[i]);
+    if (args[i].startsWith('--') && SENSITIVE_KEYS.has(args[i].substring(2)) && i + 1 < args.length) {
+      redacted.push('[REDACTED]');
+      i++;
+    }
+  }
+  return redacted;
+}
+
 function runInvoke(method, contractArgs, options) {
   if (!options.contract) {
     console.error("Error: --contract is required.");
@@ -59,7 +83,7 @@ function runInvoke(method, contractArgs, options) {
     args.push(`--${key}`, String(val));
   }
 
-  console.log(`Executing: stellar ${args.join(' ')}`);
+  console.log(`Executing: stellar ${redactArgs(args).join(' ')}`);
   try {
     const output = execFileSync('stellar', args, { encoding: 'utf-8' });
     console.log("Result:", output);
@@ -84,9 +108,13 @@ function main() {
     case 'create-hunt':
       runInvoke('create_hunt', {
         creator: options.creator,
-        name: options.name,
+        title: options.title || options.name,
+        description: options.description || "",
         start_time: options.start,
-        end_time: options.end
+        end_time: options.end,
+        max_submissions_per_minute: options['max-submissions-per-minute'] || options.max_submissions_per_minute || 10,
+        start_multiplier_bps: options['start-multiplier-bps'] || options.start_multiplier_bps || 10000,
+        default_points: options['default-points'] || options.default_points || 100
       }, options);
       break;
     
@@ -119,14 +147,17 @@ function main() {
       runInvoke('submit_answer', {
         hunt_id: options.hunt,
         clue_id: options.clue,
+        player: options.player,
         answer: options.answer,
-        player: options.player
+        submission_nonce: options.nonce || Math.floor(Math.random() * 0xffffffff),
+        submitted_at: options['submitted-at'] || options.submitted_at || Math.floor(Date.now() / 1000)
       }, options);
       break;
       
     case 'leaderboard':
       runInvoke('get_hunt_leaderboard', {
-        hunt_id: options.hunt
+        hunt_id: options.hunt,
+        limit: options.limit || 10
       }, options);
       break;
 

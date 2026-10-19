@@ -56,9 +56,17 @@ impl StringSanitizer {
         if core::str::from_utf8(&buf[..len]).is_err() {
             return Err(SanitizeError::InvalidUtf8);
         }
+        let text = core::str::from_utf8(&buf[..len])
+            .map_err(|_| SanitizeError::InvalidUtf8)?;
 
         for &b in &buf[..len] {
             if is_disallowed_control(b) {
+                return Err(SanitizeError::ControlCharacter);
+            }
+        }
+
+        for c in text.chars() {
+            if is_invisible_spoof(c) {
                 return Err(SanitizeError::ControlCharacter);
             }
         }
@@ -91,7 +99,19 @@ fn is_ascii_whitespace(b: u8) -> bool {
 }
 
 fn is_disallowed_control(b: u8) -> bool {
-    b < 0x20 && b != b'\t' && b != b'\n' && b != b'\r'
+    (b < 0x20 && b != b'\t' && b != b'\n' && b != b'\r') || b == 0x7F
+}
+
+/// Invisible Unicode that enables visual spoofing in single-line fields:
+/// bidi overrides/isolates (U+202A–U+202E, U+2066–U+2069) and zero-width
+/// characters (U+200B–U+200F, U+FEFF).
+fn is_invisible_spoof(c: char) -> bool {
+    matches!(c,
+        '\u{202A}'..='\u{202E}'
+        | '\u{2066}'..='\u{2069}'
+        | '\u{200B}'..='\u{200F}'
+        | '\u{FEFF}'
+    )
 }
 
 #[cfg(test)]
@@ -189,5 +209,39 @@ mod test {
         let result = StringSanitizer::sanitize(&env, &input, 100, false);
 
         assert_eq!(result, Err(SanitizeError::InvalidUtf8));
+    }
+
+    #[test]
+    fn test_sanitize_rejects_del() {
+        let env = Env::default();
+        let input = String::from_str(&env, "hello\x7Fworld");
+        let result = StringSanitizer::sanitize(&env, &input, 100, false);
+        assert_eq!(result, Err(SanitizeError::ControlCharacter));
+    }
+
+    #[test]
+    fn test_sanitize_rejects_bidi_override() {
+        let env = Env::default();
+        let input = String::from_str(&env, "hunt\u{202E}title");
+        let result = StringSanitizer::sanitize(&env, &input, 100, false);
+        assert_eq!(result, Err(SanitizeError::ControlCharacter));
+    }
+
+    #[test]
+    fn test_sanitize_rejects_bidi_isolate() {
+        let env = Env::default();
+        let input = String::from_str(&env, "hunt\u{2066}title");
+        let result = StringSanitizer::sanitize(&env, &input, 100, false);
+        assert_eq!(result, Err(SanitizeError::ControlCharacter));
+    }
+
+    #[test]
+    fn test_sanitize_rejects_zero_width() {
+        let env = Env::default();
+        for s in ["a\u{200B}b", "a\u{200C}b", "a\u{200D}b", "a\u{FEFF}b"] {
+            let input = String::from_str(&env, s);
+            let result = StringSanitizer::sanitize(&env, &input, 100, false);
+            assert_eq!(result, Err(SanitizeError::ControlCharacter));
+        }
     }
 }

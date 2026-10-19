@@ -276,6 +276,12 @@ Historical longer prefixes that were shortened (see ADR 002):
 | `HIST_COUNT_KEY` | `UPHCT` | upgrade history count |
 | `UPGRADE_ADMIN_KEY` | `UPADM` | upgrade admin |
 
+### Composite key shapes (migration)
+
+| Key shape | Symbol | Notes |
+|---|---|---|
+| `(UPHIS, n)` | `UPHIS` | n-th upgrade history entry (0-indexed) |
+
 Also referenced from per-contract `migration.rs` modules via event symbols
 (`UpgradeProposed`, `UpgradeExecuted`) — those are events, not storage keys.
 
