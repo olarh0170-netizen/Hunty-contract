@@ -11797,6 +11797,71 @@ mod test {
         }
 
         #[test]
+        fn test_blacklisted_creator_cannot_activate_or_edit_existing_hunt() {
+            let env = Env::default();
+            env.ledger().set_timestamp(1_700_000_000);
+            env.mock_all_auths();
+            let admin = Address::generate(&env);
+            let creator = Address::generate(&env);
+            let contract_id = env.register_contract(None, HuntyCore);
+
+            let hunt_id = as_core_contract(&env, &contract_id, |env| {
+                HuntyCore::initialize_admin(env.clone(), admin.clone()).unwrap();
+                HuntyCore::create_hunt(
+                    env.clone(),
+                    creator.clone(),
+                    String::from_str(env, "Editable Hunt"),
+                    String::from_str(env, "Description"),
+                    None,
+                    None,
+                    0,
+                    None,
+                    None,
+                )
+                .unwrap()
+            });
+
+            as_core_contract(&env, &contract_id, |env| {
+                HuntyCore::add_clue(
+                    env.clone(),
+                    hunt_id,
+                    String::from_str(env, "Question?"),
+                    String::from_str(env, "answer"),
+                    10,
+                    true,
+                    Some(1),
+                    None,
+                )
+                .unwrap();
+                HuntyCore::blacklist_creator(env.clone(), admin.clone(), creator.clone()).unwrap();
+            });
+
+            let activate_err = as_core_contract(&env, &contract_id, |env| {
+                HuntyCore::activate_hunt(env.clone(), hunt_id, creator.clone())
+            });
+            assert_eq!(activate_err, Err(HuntErrorCode::AddressBlacklisted));
+
+            let add_clue_err = as_core_contract(&env, &contract_id, |env| {
+                HuntyCore::add_clue(
+                    env.clone(),
+                    hunt_id,
+                    String::from_str(env, "Another Question?"),
+                    String::from_str(env, "answer2"),
+                    10,
+                    false,
+                    Some(1),
+                    None,
+                )
+            });
+            assert_eq!(add_clue_err, Err(HuntErrorCode::AddressBlacklisted));
+
+            let update_privacy_err = as_core_contract(&env, &contract_id, |env| {
+                HuntyCore::set_hunt_privacy(env.clone(), hunt_id, creator.clone(), true)
+            });
+            assert_eq!(update_privacy_err, Err(HuntErrorCode::AddressBlacklisted));
+        }
+
+        #[test]
         fn test_non_blacklisted_creator_can_create_hunt() {
             let env = Env::default();
             env.mock_all_auths();

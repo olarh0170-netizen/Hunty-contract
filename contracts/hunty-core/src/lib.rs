@@ -229,6 +229,13 @@ impl HuntyCore {
         Ok(())
     }
 
+    fn ensure_creator_action_allowed(env: &Env, caller: &Address) -> Result<(), HuntErrorCode> {
+        if Storage::is_blacklisted(env, caller) {
+            return Err(HuntErrorCode::AddressBlacklisted);
+        }
+        Ok(())
+    }
+
     /// Returns Ok if clues are visible to callers (hunt exists and is not in Draft).
     /// Draft-status hunts hide clue questions to prevent pre-game answer farming.
     fn require_clues_visible(env: &Env, hunt_id: u64) -> Result<(), HuntErrorCode> {
@@ -443,6 +450,7 @@ impl HuntyCore {
         template_clues: Vec<Clue>,
     ) -> Result<u64, HuntErrorCode> {
         caller.require_auth();
+        Self::ensure_creator_action_allowed(&env, &caller)?;
         let template_hunt =
             Storage::get_hunt(&env, template_hunt_id).ok_or(HuntErrorCode::HuntNotFound)?;
         if template_hunt.status != HuntStatus::Completed {
@@ -550,6 +558,7 @@ impl HuntyCore {
         time_bonus_config: Option<TimeBonusConfig>,
     ) -> Result<(), HuntErrorCode> {
         caller.require_auth();
+        Self::ensure_creator_action_allowed(&env, &caller)?;
 
         let mut hunt = Storage::get_hunt(&env, hunt_id).ok_or(HuntErrorCode::HuntNotFound)?;
 
@@ -593,6 +602,7 @@ impl HuntyCore {
         attempt_cooldown_secs: u32,
     ) -> Result<(), HuntErrorCode> {
         caller.require_auth();
+        Self::ensure_creator_action_allowed(&env, &caller)?;
 
         if max_attempts_per_clue == 0 {
             return Err(HuntErrorCode::InvalidMaxAttempts);
@@ -620,6 +630,7 @@ impl HuntyCore {
         description: String,
     ) -> Result<(), HuntErrorCode> {
         caller.require_auth();
+        Self::ensure_creator_action_allowed(&env, &caller)?;
 
         let mut hunt = Storage::get_hunt_or_error(&env, hunt_id).map_err(HuntErrorCode::from)?;
         if !Storage::is_authorized_creator_or_co_creator(&env, hunt_id, &caller) {
@@ -660,6 +671,7 @@ impl HuntyCore {
         max_players: u32,
     ) -> Result<(), HuntErrorCode> {
         caller.require_auth();
+        Self::ensure_creator_action_allowed(&env, &caller)?;
 
         let mut hunt = Storage::get_hunt_or_error(&env, hunt_id).map_err(HuntErrorCode::from)?;
         if !Storage::is_authorized_creator_or_co_creator(&env, hunt_id, &caller) {
@@ -683,6 +695,7 @@ impl HuntyCore {
         registration_deadline: u64,
     ) -> Result<(), HuntErrorCode> {
         creator.require_auth();
+        Self::ensure_creator_action_allowed(&env, &creator)?;
 
         let mut hunt = Storage::get_hunt(&env, hunt_id).ok_or(HuntErrorCode::HuntNotFound)?;
         if hunt.creator != creator {
@@ -718,6 +731,7 @@ impl HuntyCore {
         team_mode: bool,
     ) -> Result<(), HuntErrorCode> {
         creator.require_auth();
+        Self::ensure_creator_action_allowed(&env, &creator)?;
 
         let mut hunt = Storage::get_hunt(&env, hunt_id).ok_or(HuntErrorCode::HuntNotFound)?;
         if hunt.creator != creator {
@@ -741,6 +755,7 @@ impl HuntyCore {
         allow_partial_scoring: bool,
     ) -> Result<(), HuntErrorCode> {
         creator.require_auth();
+        Self::ensure_creator_action_allowed(&env, &creator)?;
 
         let mut hunt = Storage::get_hunt(&env, hunt_id).ok_or(HuntErrorCode::HuntNotFound)?;
         if hunt.creator != creator {
@@ -832,6 +847,7 @@ impl HuntyCore {
     ) -> Result<u32, HuntErrorCode> {
         let hunt = Storage::get_hunt_or_error(&env, hunt_id).map_err(HuntErrorCode::from)?;
         hunt.creator.require_auth();
+        Self::ensure_creator_action_allowed(&env, &hunt.creator)?;
         if hunt.status != HuntStatus::Draft {
             return Err(HuntErrorCode::InvalidHuntStatus);
         }
@@ -872,6 +888,7 @@ impl HuntyCore {
     ) -> Result<Vec<u32>, HuntErrorCode> {
         let hunt = Storage::get_hunt_or_error(&env, hunt_id).map_err(HuntErrorCode::from)?;
         hunt.creator.require_auth();
+        Self::ensure_creator_action_allowed(&env, &hunt.creator)?;
         if hunt.status != HuntStatus::Draft {
             return Err(HuntErrorCode::InvalidHuntStatus);
         }
@@ -1019,6 +1036,7 @@ impl HuntyCore {
             return Err(HuntErrorCode::InvalidHuntStatus);
         }
         hunt.creator.require_auth();
+        Self::ensure_creator_action_allowed(&env, &hunt.creator)?;
 
         let mut clue =
             Storage::get_clue_or_error(&env, hunt_id, clue_id).map_err(HuntErrorCode::from)?;
@@ -1168,6 +1186,7 @@ impl HuntyCore {
         categories: Vec<String>,
     ) -> Result<(), HuntErrorCode> {
         caller.require_auth();
+        Self::ensure_creator_action_allowed(&env, &caller)?;
         let mut hunt = Storage::get_hunt_or_error(&env, hunt_id).map_err(HuntErrorCode::from)?;
         if !Storage::is_authorized_creator_or_co_creator(&env, hunt_id, &caller) {
             return Err(HuntErrorCode::Unauthorized);
@@ -1247,6 +1266,7 @@ impl HuntyCore {
         difficulty_override: Option<u32>,
     ) -> Result<(), HuntErrorCode> {
         caller.require_auth();
+        Self::ensure_creator_action_allowed(&env, &caller)?;
         let mut hunt = Storage::get_hunt_or_error(&env, hunt_id).map_err(HuntErrorCode::from)?;
         if !Storage::is_authorized_creator_or_co_creator(&env, hunt_id, &caller) {
             return Err(HuntErrorCode::Unauthorized);
@@ -1286,6 +1306,7 @@ impl HuntyCore {
         hint_penalty_points: u32,
     ) -> Result<(), HuntErrorCode> {
         caller.require_auth();
+        Self::ensure_creator_action_allowed(&env, &caller)?;
         let hunt = Storage::get_hunt_or_error(&env, hunt_id).map_err(HuntErrorCode::from)?;
         if !Storage::is_authorized_creator_or_co_creator(&env, hunt_id, &caller) {
             return Err(HuntErrorCode::Unauthorized);
@@ -1677,6 +1698,7 @@ impl HuntyCore {
         // Fast validation using instance cache
         let cache = Self::get_hunt_cache_or_load(&env, hunt_id)?;
         caller.require_auth();
+        Self::ensure_creator_action_allowed(&env, &caller)?;
         if caller != cache.creator {
             return Err(HuntErrorCode::Unauthorized);
         }
@@ -1817,6 +1839,7 @@ impl HuntyCore {
     pub fn deactivate_hunt(env: Env, hunt_id: u64, caller: Address) -> Result<(), HuntErrorCode> {
         // Fast validation using instance cache
         caller.require_auth();
+        Self::ensure_creator_action_allowed(&env, &caller)?;
         let cache = Self::get_hunt_cache_or_load(&env, hunt_id)?;
         if caller != cache.creator {
             return Err(HuntErrorCode::Unauthorized);
@@ -1857,6 +1880,7 @@ impl HuntyCore {
         // Require the caller to authorize. Without this, an attacker could spoof `caller`
         // and cancel hunts by passing the creator address.
         caller.require_auth();
+        Self::ensure_creator_action_allowed(&env, &caller)?;
 
         // Fast validation using instance cache
         let cache = Self::get_hunt_cache_or_load(&env, hunt_id)?;
@@ -1975,6 +1999,7 @@ impl HuntyCore {
     /// Per-player reward failures are recorded in `HuntClosedEvent.unpaid_players`.
     pub fn close_hunt(env: Env, hunt_id: u64, caller: Address) -> Result<(), HuntErrorCode> {
         caller.require_auth();
+        Self::ensure_creator_action_allowed(&env, &caller)?;
 
         // Fast validation using instance cache
         let cache = Self::get_hunt_cache_or_load(&env, hunt_id)?;
@@ -2060,6 +2085,10 @@ impl HuntyCore {
         // Fast validation using instance cache
         let cache = Self::get_hunt_cache_or_load(&env, hunt_id)?;
 
+        if caller == cache.creator {
+            Self::ensure_creator_action_allowed(&env, &caller)?;
+        }
+
         // Check if caller is creator OR admin
         let is_creator = caller == cache.creator;
         let is_admin = Storage::get_admin(&env) == Some(caller.clone());
@@ -2126,6 +2155,10 @@ impl HuntyCore {
         // retry after a partial sweep must not depend on it.
         let hunt = Storage::get_hunt(&env, hunt_id).ok_or(HuntErrorCode::HuntNotFound)?;
 
+        if caller == hunt.creator {
+            Self::ensure_creator_action_allowed(&env, &caller)?;
+        }
+
         let is_creator = caller == hunt.creator;
         let is_admin = Storage::get_admin(&env) == Some(caller.clone());
         if !is_creator && !is_admin {
@@ -2188,6 +2221,7 @@ impl HuntyCore {
         caller: Address,
     ) -> Result<(), HuntErrorCode> {
         caller.require_auth();
+        Self::ensure_creator_action_allowed(&env, &caller)?;
 
         let mut hunt = Storage::get_hunt(&env, hunt_id).ok_or(HuntErrorCode::HuntNotFound)?;
 
@@ -2236,8 +2270,8 @@ impl HuntyCore {
         Ok(())
     }
 
-    /// Blacklists a creator address, preventing them from creating new hunts.
-    /// Caller must be the admin.
+    /// Blacklists a creator address, preventing them from creating new hunts and
+    /// mutating hunts they own. Caller must be the admin.
     pub fn blacklist_creator(
         env: Env,
         admin: Address,
@@ -2703,6 +2737,7 @@ impl HuntyCore {
         invite_code: String,
     ) -> Result<(), HuntErrorCode> {
         creator.require_auth();
+        Self::ensure_creator_action_allowed(&env, &creator)?;
 
         let mut hunt = Storage::get_hunt(&env, hunt_id).ok_or(HuntErrorCode::HuntNotFound)?;
 
@@ -2766,6 +2801,7 @@ impl HuntyCore {
         is_private: bool,
     ) -> Result<(), HuntErrorCode> {
         creator.require_auth();
+        Self::ensure_creator_action_allowed(&env, &creator)?;
 
         let mut hunt = Storage::get_hunt(&env, hunt_id).ok_or(HuntErrorCode::HuntNotFound)?;
 
@@ -2813,6 +2849,7 @@ impl HuntyCore {
         creator: Address,
     ) -> Result<(), HuntErrorCode> {
         creator.require_auth();
+        Self::ensure_creator_action_allowed(&env, &creator)?;
 
         let mut hunt = Storage::get_hunt(&env, hunt_id).ok_or(HuntErrorCode::HuntNotFound)?;
 
@@ -2855,8 +2892,11 @@ impl HuntyCore {
         let is_admin = Storage::get_admin(&env)
             .map(|a| a == caller)
             .unwrap_or(false);
-        if !is_admin && !Storage::is_authorized_creator_or_co_creator(&env, hunt_id, &caller) {
-            return Err(HuntErrorCode::Unauthorized);
+        if !is_admin {
+            Self::ensure_creator_action_allowed(&env, &caller)?;
+            if !Storage::is_authorized_creator_or_co_creator(&env, hunt_id, &caller) {
+                return Err(HuntErrorCode::Unauthorized);
+            }
         }
 
         Storage::ban_player(&env, hunt_id, &player);
@@ -2889,8 +2929,11 @@ impl HuntyCore {
         let is_admin = Storage::get_admin(&env)
             .map(|a| a == caller)
             .unwrap_or(false);
-        if !is_admin && !Storage::is_authorized_creator_or_co_creator(&env, hunt_id, &caller) {
-            return Err(HuntErrorCode::Unauthorized);
+        if !is_admin {
+            Self::ensure_creator_action_allowed(&env, &caller)?;
+            if !Storage::is_authorized_creator_or_co_creator(&env, hunt_id, &caller) {
+                return Err(HuntErrorCode::Unauthorized);
+            }
         }
 
         Storage::unban_player(&env, hunt_id, &player);
@@ -4051,6 +4094,7 @@ impl HuntyCore {
         viewer: Address,
     ) -> Result<(), HuntErrorCode> {
         creator.require_auth();
+        Self::ensure_creator_action_allowed(&env, &creator)?;
 
         let hunt = Storage::get_hunt(&env, hunt_id).ok_or(HuntErrorCode::HuntNotFound)?;
 
@@ -4078,6 +4122,7 @@ impl HuntyCore {
         viewer: Address,
     ) -> Result<(), HuntErrorCode> {
         creator.require_auth();
+        Self::ensure_creator_action_allowed(&env, &creator)?;
 
         let hunt = Storage::get_hunt(&env, hunt_id).ok_or(HuntErrorCode::HuntNotFound)?;
 
@@ -4113,6 +4158,7 @@ impl HuntyCore {
         new_co_creator: Address,
     ) -> Result<(), HuntErrorCode> {
         creator.require_auth();
+        Self::ensure_creator_action_allowed(&env, &creator)?;
         let hunt = Storage::get_hunt(&env, hunt_id).ok_or(HuntErrorCode::HuntNotFound)?;
         if hunt.creator != creator {
             return Err(HuntErrorCode::Unauthorized);
@@ -4140,6 +4186,7 @@ impl HuntyCore {
         co_creator_to_remove: Address,
     ) -> Result<(), HuntErrorCode> {
         creator.require_auth();
+        Self::ensure_creator_action_allowed(&env, &creator)?;
         let hunt = Storage::get_hunt(&env, hunt_id).ok_or(HuntErrorCode::HuntNotFound)?;
         if hunt.creator != creator {
             return Err(HuntErrorCode::Unauthorized);
